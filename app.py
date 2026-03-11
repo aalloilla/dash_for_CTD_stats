@@ -451,5 +451,5 @@ def _update_fig2(var: str, station_type: str, depth_value: str | None):
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
-
+    app.run_server(host="0.0.0.0", port=8080)
+    #    app.run(debug=True)
