@@ -252,6 +252,298 @@ def _fig_month_on_x(var: str, station_type: str, depth_bin: DepthBin) -> tuple[g
     return fig, ""
 
 
+@dataclass(frozen=True)
+class SeasonSegment:
+    start_month: int
+    end_month: int
+    lower: float
+    upper: float
+
+    @property
+    def label(self) -> str:
+        return f"{self.start_month}–{self.end_month}: [{self.lower:.4g}, {self.upper:.4g}]"
+
+
+def _season_partition_cost(q1: list[float], q3: list[float], segments: list[tuple[int, int]]) -> float:
+    total = 0.0
+    for i, j in segments:
+        seg_q1 = q1[i : j + 1]
+        seg_q3 = q3[i : j + 1]
+        if not seg_q1 or not seg_q3:
+            continue
+        low = min(seg_q1)
+        high = max(seg_q3)
+        total += sum(v - low for v in seg_q1) + sum(high - v for v in seg_q3)
+    return float(total)
+
+
+def _optimal_season_segments_linear(months: list[int], q1: list[float], q3: list[float], seasons: int) -> tuple[list[tuple[int, int]], float]:
+    """
+    Partition the month indices into `seasons` contiguous segments to minimize:
+      sum_k (q1_k - min(q1 in seg(k))) + (max(q3 in seg(k)) - q3_k)
+    With the implied "cover" limits:
+      lower = min(q1 in segment), upper = max(q3 in segment)
+    """
+    n = len(months)
+    if n == 0:
+        return [], 0.0
+    seasons = max(1, min(int(seasons), 4, n))
+
+    # Precompute segment costs.
+    cost = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        min_q1 = q1[i]
+        max_q3 = q3[i]
+        sum_q1 = 0.0
+        sum_q3 = 0.0
+        for j in range(i, n):
+            min_q1 = min(min_q1, q1[j])
+            max_q3 = max(max_q3, q3[j])
+            sum_q1 += q1[j]
+            sum_q3 += q3[j]
+            seg_len = j - i + 1
+            cost[i][j] = (sum_q1 - seg_len * min_q1) + (seg_len * max_q3 - sum_q3)
+
+    # DP: dp[s][j] = min cost to partition 0..j into s segments
+    INF = 1e300
+    dp = [[INF] * n for _ in range(seasons + 1)]
+    prev = [[-1] * n for _ in range(seasons + 1)]
+
+    for j in range(n):
+        dp[1][j] = cost[0][j]
+        prev[1][j] = -1
+
+    for s in range(2, seasons + 1):
+        for j in range(n):
+            best = INF
+            best_i = -1
+            # last segment starts at i (>= s-1)
+            for i in range(s - 1, j + 1):
+                v = dp[s - 1][i - 1] + cost[i][j] if i - 1 >= 0 else INF
+                if v < best:
+                    best = v
+                    best_i = i
+            dp[s][j] = best
+            prev[s][j] = best_i
+
+    # Reconstruct.
+    s = seasons
+    j = n - 1
+    segments: list[tuple[int, int]] = []
+    while s >= 1 and j >= 0:
+        i = prev[s][j]
+        if s == 1:
+            segments.append((0, j))
+            break
+        if i < 0:
+            # Shouldn't happen, but fall back to a single segment.
+            segments = [(0, n - 1)]
+            break
+        segments.append((i, j))
+        j = i - 1
+        s -= 1
+    segments.reverse()
+    return segments, _season_partition_cost(q1, q3, segments)
+
+
+def _optimal_season_month_groups_wrap(months: list[int], q1: list[float], q3: list[float], seasons: int) -> list[list[int]]:
+    """
+    Like the linear optimizer, but months are on a circle and segments may wrap across Dec->Jan.
+
+    Strategy: try every rotation of the observed months, solve the linear DP, and pick the
+    lowest-cost solution. n is small (<= 12), so this is fast.
+    """
+    n = len(months)
+    if n == 0:
+        return []
+    seasons = max(1, min(int(seasons), 4, n))
+
+    best_cost = 1e300
+    best_groups: list[list[int]] = []
+
+    for r in range(n):
+        months_r = months[r:] + months[:r]
+        q1_r = q1[r:] + q1[:r]
+        q3_r = q3[r:] + q3[:r]
+
+        segs, cost = _optimal_season_segments_linear(months_r, q1_r, q3_r, seasons=seasons)
+        if cost < best_cost:
+            best_cost = cost
+            best_groups = [months_r[i : j + 1] for (i, j) in segs]
+
+    return best_groups
+
+
+def _add_season_limits(fig: go.Figure, sub: pd.DataFrame, seasons: int) -> tuple[go.Figure, str]:
+    if sub.empty:
+        return fig, ""
+
+    s = max(1, min(int(seasons), 4))
+    sub2 = sub.dropna(subset=["month", "p01", "p99"]).copy()
+    if sub2.empty:
+        return fig, ""
+
+    sub2["month"] = sub2["month"].astype(int)
+    sub2 = sub2.sort_values(["month"])
+
+    months = sub2["month"].astype(int).to_list()
+    q1 = sub2["p01"].astype(float).to_list()
+    q3 = sub2["p99"].astype(float).to_list()
+    if len(months) < 2:
+        return fig, ""
+
+    groups = _optimal_season_month_groups_wrap(months, q1, q3, seasons=s)
+    palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+
+    segments: list[SeasonSegment] = []
+    for k, seg_months in enumerate(groups):
+        if not seg_months:
+            continue
+
+        # Compute limits using the underlying q1/q3 arrays for these months.
+        idx = [i for i, m in enumerate(months) if m in set(seg_months)]
+        seg_q1 = [q1[i] for i in idx]
+        seg_q3 = [q3[i] for i in idx]
+        if not seg_q1 or not seg_q3:
+            continue
+
+        low = float(min(seg_q1))
+        high = float(max(seg_q3))
+        segments.append(
+            SeasonSegment(start_month=int(seg_months[0]), end_month=int(seg_months[-1]), lower=low, upper=high)
+        )
+
+        # Draw as one or two traces if it wraps, to avoid a diagonal jump from Dec to Jan.
+        color = palette[k % len(palette)]
+        blocks: list[list[int]] = []
+        current: list[int] = []
+        prev_m: int | None = None
+        for m in seg_months:
+            if prev_m is not None and m < prev_m:
+                if current:
+                    blocks.append(current)
+                current = [m]
+            else:
+                current.append(m)
+            prev_m = m
+        if current:
+            blocks.append(current)
+
+        for bi, x in enumerate(blocks):
+            showlegend = bi == 0
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=[low] * len(x),
+                    mode="lines",
+                    line=dict(color=color, width=2, dash="dash"),
+                    name=f"Season {k + 1} lower",
+                    legendgroup=f"season{k + 1}",
+                    showlegend=showlegend,
+                    hovertemplate=f"Season {k + 1} lower<br>months {segments[-1].start_month}–{segments[-1].end_month}<br>y={low:.4g}<extra></extra>",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=[high] * len(x),
+                    mode="lines",
+                    line=dict(color=color, width=2, dash="dash"),
+                    name=f"Season {k + 1} upper",
+                    legendgroup=f"season{k + 1}",
+                    showlegend=False,
+                    hovertemplate=f"Season {k + 1} upper<br>months {segments[-1].start_month}–{segments[-1].end_month}<br>y={high:.4g}<extra></extra>",
+                )
+            )
+
+    season_text = "; ".join([seg.label for seg in segments])
+    return fig, f"Season limits ({s}): {season_text}"
+
+
+def _fixed_season_limits(sub: pd.DataFrame) -> tuple[SeasonSegment | None, SeasonSegment | None]:
+    """
+    Fixed seasons:
+      - Season A: months 12 through 5 (wrap) => {12,1,2,3,4,5}
+      - Season B: months 6 through 11        => {6,7,8,9,10,11}
+    Limits cover q1/q3 where q1=p01 and q3=p99.
+    """
+    if sub.empty:
+        return None, None
+
+    sub2 = sub.dropna(subset=["month", "p01", "p99"]).copy()
+    if sub2.empty:
+        return None, None
+
+    sub2["month"] = sub2["month"].astype(int)
+    season_a = {12, 1, 2, 3, 4, 5}
+    season_b = {6, 7, 8, 9, 10, 11}
+
+    def seg(month_set: set[int], start: int, end: int) -> SeasonSegment | None:
+        ss = sub2[sub2["month"].isin(month_set)]
+        if ss.empty:
+            return None
+        low = float(ss["p01"].min())
+        high = float(ss["p99"].max())
+        return SeasonSegment(start_month=start, end_month=end, lower=low, upper=high)
+
+    return seg(season_a, 12, 5), seg(season_b, 6, 11)
+
+
+def _add_fixed_season_limits(fig: go.Figure, sub: pd.DataFrame) -> tuple[go.Figure, str]:
+    a, b = _fixed_season_limits(sub)
+    if not a and not b:
+        return fig, "No data for fixed-season limits."
+
+    def add_segment(seg: SeasonSegment, color: str):
+        # Draw as two blocks if it wraps (12..12 and 1..6).
+        if seg.start_month == 12 and seg.end_month == 5:
+            blocks = [[12], [1, 2, 3, 4, 5]]
+        else:
+            blocks = [list(range(seg.start_month, seg.end_month + 1))]
+
+        for bi, x in enumerate(blocks):
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=[seg.lower] * len(x),
+                    mode="lines",
+                    line=dict(color=color, width=2, dash="dash"),
+                    name=f"{seg.start_month}–{seg.end_month} lower",
+                    legendgroup=f"fixed{seg.start_month}-{seg.end_month}",
+                    showlegend=bi == 0,
+                    hovertemplate=f"Fixed season lower<br>months {seg.start_month}–{seg.end_month}<br>y={seg.lower:.4g}<extra></extra>",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=[seg.upper] * len(x),
+                    mode="lines",
+                    line=dict(color=color, width=2, dash="dash"),
+                    name=f"{seg.start_month}–{seg.end_month} upper",
+                    legendgroup=f"fixed{seg.start_month}-{seg.end_month}",
+                    showlegend=False,
+                    hovertemplate=f"Fixed season upper<br>months {seg.start_month}–{seg.end_month}<br>y={seg.upper:.4g}<extra></extra>",
+                )
+            )
+
+    if a:
+        add_segment(a, "#7a1fa2")
+    if b:
+        add_segment(b, "#1f9e89")
+
+    parts: list[str] = []
+    if a:
+        parts.append(f"12–5: lower={a.lower:.6g}, upper={a.upper:.6g}")
+    else:
+        parts.append("12–5: (no data)")
+    if b:
+        parts.append(f"6–11: lower={b.lower:.6g}, upper={b.upper:.6g}")
+    else:
+        parts.append("6–11: (no data)")
+    return fig, "Fixed-season limits: " + " | ".join(parts)
+
+
 app = Dash(__name__)
 app.title = "CTD stats (Dash)"
 server = app.server
@@ -273,6 +565,12 @@ if init_var and init_station and init_depth:
     init_fig2, init_status2 = _fig_month_on_x(init_var, init_station, DepthBin.from_value(init_depth))
 else:
     init_fig2, init_status2 = go.Figure(), ""
+
+if init_var and init_station and init_depth:
+    _sub_init3 = _subset_month_on_x(init_var, init_station, DepthBin.from_value(init_depth))
+    init_fig3, init_status3 = _add_fixed_season_limits(init_fig2, _sub_init3)
+else:
+    init_fig3, init_status3 = go.Figure(), ""
 
 app.layout = html.Div(
     style={"maxWidth": "1100px", "margin": "0 auto", "padding": "18px 14px", "fontFamily": "system-ui"},
@@ -357,7 +655,7 @@ app.layout = html.Div(
                         html.Div(
                             style={
                                 "display": "grid",
-                                "gridTemplateColumns": "2fr 2fr 2fr",
+                                "gridTemplateColumns": "2fr 2fr 2fr 1fr",
                                 "gap": "10px",
                                 "alignItems": "end",
                                 "marginTop": "10px",
@@ -396,6 +694,17 @@ app.layout = html.Div(
                                         ),
                                     ]
                                 ),
+                                html.Div(
+                                    [
+                                        html.Div("seasons", style={"fontWeight": 600}),
+                                        dcc.Dropdown(
+                                            id="seasons2",
+                                            options=[{"label": str(i), "value": i} for i in range(1, 5)],
+                                            value=1,
+                                            clearable=False,
+                                        ),
+                                    ]
+                                ),
                             ],
                         ),
                         html.Div(
@@ -404,6 +713,62 @@ app.layout = html.Div(
                             style={"marginTop": "8px", "fontWeight": 600, "color": "#8a2b2b"},
                         ),
                         dcc.Graph(id="fig2", figure=init_fig2, style={"marginTop": "6px"}),
+                    ],
+                ),
+                dcc.Tab(
+                    label="Months on x (fixed seasons 12–6 / 7–11)",
+                    value="tab-fixed",
+                    children=[
+                        html.Div(
+                            style={
+                                "display": "grid",
+                                "gridTemplateColumns": "2fr 2fr 2fr",
+                                "gap": "10px",
+                                "alignItems": "end",
+                                "marginTop": "10px",
+                            },
+                            children=[
+                                html.Div(
+                                    [
+                                        html.Div("variable", style={"fontWeight": 600}),
+                                        dcc.Dropdown(
+                                            id="var3",
+                                            options=[{"label": v, "value": v} for v in VARIABLES],
+                                            value=init_var,
+                                            clearable=False,
+                                        ),
+                                    ]
+                                ),
+                                html.Div(
+                                    [
+                                        html.Div("station_type", style={"fontWeight": 600}),
+                                        dcc.Dropdown(
+                                            id="station3",
+                                            options=[{"label": s, "value": s} for s in STATION_TYPES],
+                                            value=init_station,
+                                            clearable=False,
+                                        ),
+                                    ]
+                                ),
+                                html.Div(
+                                    [
+                                        html.Div("depth_bin", style={"fontWeight": 600}),
+                                        dcc.Dropdown(
+                                            id="depth3",
+                                            options=init_depth_options,
+                                            value=init_depth,
+                                            clearable=False,
+                                        ),
+                                    ]
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            id="status3",
+                            children=init_status3,
+                            style={"marginTop": "8px", "fontWeight": 600, "color": "#8a2b2b"},
+                        ),
+                        dcc.Graph(id="fig3", figure=init_fig3, style={"marginTop": "6px"}),
                     ],
                 ),
             ],
@@ -426,8 +791,9 @@ def _update_fig1(var: str, station_type: str, month: int):
     Input("var2", "value"),
     Input("station2", "value"),
     Input("depth2", "value"),
+    Input("seasons2", "value"),
 )
-def _update_fig2(var: str, station_type: str, depth_value: str | None):
+def _update_fig2(var: str, station_type: str, depth_value: str | None, seasons: int):
     bins = _depth_bin_options(var, station_type)
     options = [{"label": b.label, "value": b.value} for b in bins]
 
@@ -447,7 +813,51 @@ def _update_fig2(var: str, station_type: str, depth_value: str | None):
 
     depth_bin = DepthBin.from_value(depth_value)
     fig, status = _fig_month_on_x(var, station_type, depth_bin)
-    return options, depth_value, fig, status
+
+    # Add seasonal lower/upper limits that cover q1/q3 (p01/p99) and minimize slack.
+    sub = _subset_month_on_x(var, station_type, depth_bin)
+    fig2, season_status = _add_season_limits(fig, sub, seasons=seasons or 1)
+    combined_status = season_status or status
+    if status and season_status:
+        combined_status = f"{status} | {season_status}"
+    return options, depth_value, fig2, combined_status
+
+
+@app.callback(
+    Output("depth3", "options"),
+    Output("depth3", "value"),
+    Output("fig3", "figure"),
+    Output("status3", "children"),
+    Input("var3", "value"),
+    Input("station3", "value"),
+    Input("depth3", "value"),
+)
+def _update_fig3(var: str, station_type: str, depth_value: str | None):
+    bins = _depth_bin_options(var, station_type)
+    options = [{"label": b.label, "value": b.value} for b in bins]
+
+    if not bins:
+        fig = go.Figure()
+        fig.update_layout(
+            title=f"{var} | {station_type} (no depth bins)",
+            template="plotly_white",
+            height=600,
+            margin=dict(l=60, r=30, t=60, b=60),
+        )
+        return options, None, fig, "No depth bins for this selection."
+
+    valid_values = {b.value for b in bins}
+    if depth_value not in valid_values:
+        depth_value = bins[0].value
+
+    depth_bin = DepthBin.from_value(depth_value)
+    fig, status = _fig_month_on_x(var, station_type, depth_bin)
+    sub = _subset_month_on_x(var, station_type, depth_bin)
+    fig3, limits_status = _add_fixed_season_limits(fig, sub)
+    combined_status = limits_status or status
+    if status and limits_status:
+        combined_status = f"{status} | {limits_status}"
+    return options, depth_value, fig3, combined_status
 
 
 if __name__ == "__main__":
