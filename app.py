@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -71,6 +72,232 @@ DF = _load_df(CSV_PATH)
 VARIABLES = sorted(DF["variable"].unique().tolist())
 STATION_TYPES = sorted(DF["station_type"].unique().tolist())
 MONTHS = sorted(DF["month"].dropna().unique().astype(int).tolist())
+
+STATIONS_CSV = HERE / "Station_Mean_Coords.csv"
+POLYGON_GEOJSON_PATH = HERE / "polygon_shallow_lte15m_SouthFlorida.geojson"
+STATION_CLASSIFICATION_JSON = HERE / "station_depth_classification.json"
+
+
+def _load_stations(csv_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    required = {"station", "lat_mean", "lon_mean"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Stations CSV is missing required columns: {sorted(missing)}")
+
+    df = df.copy()
+    df["lat_mean"] = pd.to_numeric(df["lat_mean"], errors="coerce")
+    df["lon_mean"] = pd.to_numeric(df["lon_mean"], errors="coerce")
+    df["station"] = df["station"].astype(str)
+    df = df.dropna(subset=["lat_mean", "lon_mean", "station"])
+    return df
+
+
+def _load_geojson(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+STATIONS_DF = _load_stations(STATIONS_CSV) if STATIONS_CSV.exists() else pd.DataFrame(columns=["station", "lat_mean", "lon_mean"])
+POLYGON_GEOJSON = _load_geojson(POLYGON_GEOJSON_PATH) if POLYGON_GEOJSON_PATH.exists() else None
+
+
+def _get_prepared_shallow_geom():
+    """
+    Returns (hit_test_fn, info_message).
+
+    The returned function tests whether a (lon, lat) point intersects the shallow polygon
+    union (intersects is more forgiving than strict contains and includes boundary points).
+    """
+    if not isinstance(POLYGON_GEOJSON, dict) or POLYGON_GEOJSON.get("type") != "FeatureCollection":
+        return None, "Polygon GeoJSON missing or invalid."
+
+    try:
+        from shapely.geometry import Point, shape
+        from shapely.ops import unary_union
+        from shapely.prepared import prep
+    except Exception as e:
+        return None, f"Shapely unavailable ({type(e).__name__})."
+
+    feats = POLYGON_GEOJSON.get("features") or []
+    geoms = []
+    for ft in feats:
+        geom = ft.get("geometry")
+        if not geom:
+            continue
+        try:
+            geoms.append(shape(geom))
+        except Exception:
+            continue
+
+    if not geoms:
+        return None, "No polygon geometries found in GeoJSON."
+
+    try:
+        union = unary_union(geoms)
+        prepared = prep(union)
+        minx, miny, maxx, maxy = union.bounds
+    except Exception as e:
+        return None, f"Failed to build polygon union ({type(e).__name__})."
+
+    def hit(lon: float, lat: float) -> bool:
+        # Shapely Point is (x, y) == (lon, lat)
+        return bool(prepared.intersects(Point(float(lon), float(lat))))
+
+    info = f"Polygon bounds lon[{minx:.3f},{maxx:.3f}] lat[{miny:.3f},{maxy:.3f}]"
+    return hit, info
+
+
+_SHALLOW_HIT, _SHALLOW_INFO = _get_prepared_shallow_geom()
+
+
+def _auto_zoom(lat: list[float], lon: list[float]) -> int:
+    if not lat or not lon:
+        return 6
+    lat_range = max(lat) - min(lat)
+    lon_range = max(lon) - min(lon)
+    r = max(lat_range, lon_range)
+    if r > 20:
+        return 3
+    if r > 10:
+        return 4
+    if r > 5:
+        return 5
+    if r > 2:
+        return 6
+    if r > 1:
+        return 7
+    if r > 0.5:
+        return 8
+    return 9
+
+
+def _fig_station_map() -> tuple[go.Figure, str]:
+    if STATIONS_DF.empty:
+        fig = go.Figure()
+        fig.update_layout(template="plotly_white", height=650, margin=dict(l=10, r=10, t=30, b=10))
+        return fig, f"Missing or empty stations file: {STATIONS_CSV.name}"
+
+    lats = STATIONS_DF["lat_mean"].astype(float).tolist()
+    lons = STATIONS_DF["lon_mean"].astype(float).tolist()
+    center = {"lat": float(sum(lats) / len(lats)), "lon": float(sum(lons) / len(lons))}
+    zoom = _auto_zoom(lats, lons)
+
+    fig = go.Figure()
+
+    # Polygon overlay (if available)
+    if isinstance(POLYGON_GEOJSON, dict) and POLYGON_GEOJSON.get("type") == "FeatureCollection":
+        feats = POLYGON_GEOJSON.get("features") or []
+        locations = []
+        for i, ft in enumerate(feats):
+            locations.append(ft.get("id") or str(i))
+
+        # Ensure each feature has an id so Plotly can match `locations`.
+        for i, ft in enumerate(feats):
+            if "id" not in ft or ft["id"] is None:
+                ft["id"] = str(i)
+
+        fig.add_trace(
+            go.Choroplethmapbox(
+                geojson=POLYGON_GEOJSON,
+                locations=locations,
+                z=[1] * len(locations),
+                showscale=False,
+                colorscale=[[0, "rgba(0, 123, 255, 0.35)"], [1, "rgba(0, 123, 255, 0.35)"]],
+                marker_opacity=0.45,
+                marker_line_width=2,
+                marker_line_color="rgba(0, 123, 255, 0.90)",
+                hovertemplate="Shallow polygon<extra></extra>",
+                name="Shallow polygon",
+            )
+        )
+
+    stations = STATIONS_DF.copy()
+    if _SHALLOW_HIT is not None:
+        stations["in_polygon"] = [
+            bool(_SHALLOW_HIT(lon, lat))
+            for lon, lat in zip(stations["lon_mean"].astype(float), stations["lat_mean"].astype(float))
+        ]
+    else:
+        stations["in_polygon"] = False
+
+    inside = stations[stations["in_polygon"]].copy()
+    outside = stations[~stations["in_polygon"]].copy()
+
+    # Export station classification for downstream use.
+    if _SHALLOW_HIT is not None:
+        shallow = (
+            stations.loc[stations["in_polygon"], "station"].astype(str).dropna().drop_duplicates().sort_values().tolist()
+        )
+        deep = (
+            stations.loc[~stations["in_polygon"], "station"].astype(str).dropna().drop_duplicates().sort_values().tolist()
+        )
+        payload = {"shallow": shallow, "deep": deep}
+        try:
+            STATION_CLASSIFICATION_JSON.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        except Exception:
+            # Non-fatal; map should still render.
+            pass
+
+    # Station points (outside first so inside is on top)
+    if not outside.empty:
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=outside["lat_mean"].astype(float).tolist(),
+                lon=outside["lon_mean"].astype(float).tolist(),
+                mode="markers",
+                marker=dict(size=8, color="rgba(120, 120, 120, 0.75)"),
+                text=outside["station"].tolist(),
+                hovertemplate="Station %{text}<br>Outside polygon<br>(%{lat:.4f}, %{lon:.4f})<extra></extra>",
+                name="Stations (outside)",
+            )
+        )
+
+    if not inside.empty:
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=inside["lat_mean"].astype(float).tolist(),
+                lon=inside["lon_mean"].astype(float).tolist(),
+                mode="markers",
+                marker=dict(size=10, color="rgba(220, 20, 60, 0.92)"),
+                text=inside["station"].tolist(),
+                hovertemplate="Station %{text}<br><b>Inside polygon</b><br>(%{lat:.4f}, %{lon:.4f})<extra></extra>",
+                name="Stations (inside)",
+            )
+        )
+
+    fig.update_layout(
+        title=dict(
+            text="Stations and shallow polygon",
+            y=0.99,
+            yanchor="top",
+            pad=dict(b=10),
+        ),
+        height=650,
+        margin=dict(l=10, r=10, t=70, b=10),
+        # Use a minimal raster basemap without admin boundary clutter.
+        mapbox=dict(
+            style="white-bg",
+            center=center,
+            zoom=zoom,
+            layers=[
+                {
+                    "sourcetype": "raster",
+                    "source": ["https://basemaps.cartocdn.com/rastertiles/light_nolabels/{z}/{x}/{y}.png"],
+                    "below": "traces",
+                }
+            ],
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=0.965, xanchor="left", x=0),
+    )
+    if _SHALLOW_HIT is None:
+        status = f"Inside/outside unavailable. {_SHALLOW_INFO}"
+    else:
+        status = (
+            f"Stations inside polygon: {len(inside)} | outside: {len(outside)}. "
+            f"Wrote: {STATION_CLASSIFICATION_JSON.name}. {_SHALLOW_INFO}"
+        )
+    return fig, status
 
 
 def _subset_depth_on_x(var: str, station_type: str, month: int) -> pd.DataFrame:
@@ -572,6 +799,8 @@ if init_var and init_station and init_depth:
 else:
     init_fig3, init_status3 = go.Figure(), ""
 
+init_map_fig, init_map_status = _fig_station_map()
+
 app.layout = html.Div(
     style={"maxWidth": "1100px", "margin": "0 auto", "padding": "18px 14px", "fontFamily": "system-ui"},
     children=[
@@ -592,6 +821,18 @@ app.layout = html.Div(
         dcc.Tabs(
             value="tab-depth",
             children=[
+                dcc.Tab(
+                    label="Map",
+                    value="tab-map",
+                    children=[
+                        html.Div(
+                            id="map-status",
+                            children=init_map_status,
+                            style={"marginTop": "10px", "fontWeight": 600, "color": "#8a2b2b"},
+                        ),
+                        dcc.Graph(id="map-fig", figure=init_map_fig, style={"marginTop": "6px"}),
+                    ],
+                ),
                 dcc.Tab(
                     label="Depth bins on x (choose month)",
                     value="tab-depth",

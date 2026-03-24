@@ -1,3 +1,4 @@
 dash>=2.0
 pandas>=2.0
 plotly>=5.0
+shapely>=2.0

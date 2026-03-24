@@ -14,6 +14,10 @@ python app.py
 
 Then open the URL printed in the terminal (typically `http://127.0.0.1:8050`).
 
+## Map tab notes
+
+The map tab uses `shapely` to determine whether each station point is inside the shallow polygon.
+
 ## Export fixed-season limit suggestions (all combinations)
 
 This generates limit suggestions for **every** `(variable, station_type, depth_bin_low, depth_bin_high)` using the same fixed seasons as the 3rd plot:
