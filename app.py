@@ -11,15 +11,10 @@ from dash import Dash, Input, Output, dcc, html
 
 HERE = Path(__file__).resolve().parent
 
-
-def _find_default_csv() -> Path:
-    csvs = sorted(HERE.glob("*.csv"))
-    if not csvs:
-        raise FileNotFoundError(f"No .csv files found in {HERE}")
-    return csvs[0]
-
-
-CSV_PATH = _find_default_csv()
+# Pin to the expected stats file (instead of "first CSV in folder").
+CSV_PATH = HERE / "stats_by_depth_all.csv"
+if not CSV_PATH.exists():
+    raise FileNotFoundError(f"Expected CSV not found: {CSV_PATH}")
 
 
 REQUIRED_COLS = {
