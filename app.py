@@ -6,15 +6,17 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, dcc, html
+from dash import Dash, Input, Output, State, dcc, html
 
 
 HERE = Path(__file__).resolve().parent
 
-# Pin to the expected stats file (instead of "first CSV in folder").
-CSV_PATH = HERE / "stats_by_depth_all.csv"
-if not CSV_PATH.exists():
-    raise FileNotFoundError(f"Expected CSV not found: {CSV_PATH}")
+STATS_FILE_OPTIONS = ["stats_by_depth_all.csv", "stats_by_depth_all_v2.csv"]
+STATS_PATHS = [HERE / name for name in STATS_FILE_OPTIONS if (HERE / name).exists()]
+if not STATS_PATHS:
+    raise FileNotFoundError(f"No stats CSVs found. Expected one of: {STATS_FILE_OPTIONS} in {HERE}")
+
+DEFAULT_STATS_FILE = STATS_PATHS[0].name
 
 
 REQUIRED_COLS = {
@@ -62,11 +64,28 @@ def _load_df(csv_path: Path) -> pd.DataFrame:
     return df
 
 
-DF = _load_df(CSV_PATH)
+_STATS_CACHE: dict[str, pd.DataFrame] = {}
 
-VARIABLES = sorted(DF["variable"].unique().tolist())
-STATION_TYPES = sorted(DF["station_type"].unique().tolist())
-MONTHS = sorted(DF["month"].dropna().unique().astype(int).tolist())
+
+def _get_stats_df(stats_file: str) -> pd.DataFrame:
+    # Only allow known filenames (avoid arbitrary reads via URL params etc.)
+    if stats_file not in STATS_FILE_OPTIONS:
+        stats_file = DEFAULT_STATS_FILE
+    path = HERE / stats_file
+    if not path.exists():
+        # Fall back to default available file.
+        path = HERE / DEFAULT_STATS_FILE
+        stats_file = DEFAULT_STATS_FILE
+    if stats_file not in _STATS_CACHE:
+        _STATS_CACHE[stats_file] = _load_df(path)
+    return _STATS_CACHE[stats_file]
+
+
+def _stats_meta(df: pd.DataFrame) -> tuple[list[str], list[str], list[int]]:
+    variables = sorted(df["variable"].unique().tolist())
+    station_types = sorted(df["station_type"].unique().tolist())
+    months = sorted(df["month"].dropna().unique().astype(int).tolist())
+    return variables, station_types, months
 
 STATIONS_CSV = HERE / "Station_Mean_Coords.csv"
 POLYGON_GEOJSON_PATH = HERE / "polygon_shallow_lte15m_SouthFlorida.geojson"
@@ -295,8 +314,8 @@ def _fig_station_map() -> tuple[go.Figure, str]:
     return fig, status
 
 
-def _subset_depth_on_x(var: str, station_type: str, month: int) -> pd.DataFrame:
-    sub = DF[(DF["variable"] == var) & (DF["station_type"] == station_type) & (DF["month"] == month)].copy()
+def _subset_depth_on_x(df: pd.DataFrame, var: str, station_type: str, month: int) -> pd.DataFrame:
+    sub = df[(df["variable"] == var) & (df["station_type"] == station_type) & (df["month"] == month)].copy()
     return sub.sort_values(["depth_bin_low", "depth_bin_high"])
 
 
@@ -329,8 +348,8 @@ def _hover_text_depth(sub: pd.DataFrame) -> list[str]:
     ]
 
 
-def _fig_depth_on_x(var: str, station_type: str, month: int) -> tuple[go.Figure, str]:
-    sub = _subset_depth_on_x(var, station_type, month)
+def _fig_depth_on_x(df: pd.DataFrame, var: str, station_type: str, month: int) -> tuple[go.Figure, str]:
+    sub = _subset_depth_on_x(df, var, station_type, month)
     title = f"{var} | {station_type} | month={month}"
 
     if sub.empty:
@@ -388,9 +407,9 @@ class DepthBin:
         return DepthBin(float(low_s), float(high_s))
 
 
-def _depth_bin_options(var: str, station_type: str) -> list[DepthBin]:
+def _depth_bin_options(df: pd.DataFrame, var: str, station_type: str) -> list[DepthBin]:
     bins = (
-        DF[(DF["variable"] == var) & (DF["station_type"] == station_type)][["depth_bin_low", "depth_bin_high"]]
+        df[(df["variable"] == var) & (df["station_type"] == station_type)][["depth_bin_low", "depth_bin_high"]]
         .drop_duplicates()
         .dropna()
         .sort_values(["depth_bin_low", "depth_bin_high"])
@@ -401,12 +420,12 @@ def _depth_bin_options(var: str, station_type: str) -> list[DepthBin]:
     return out
 
 
-def _subset_month_on_x(var: str, station_type: str, depth_bin: DepthBin) -> pd.DataFrame:
-    sub = DF[
-        (DF["variable"] == var)
-        & (DF["station_type"] == station_type)
-        & (DF["depth_bin_low"] == depth_bin.low)
-        & (DF["depth_bin_high"] == depth_bin.high)
+def _subset_month_on_x(df: pd.DataFrame, var: str, station_type: str, depth_bin: DepthBin) -> pd.DataFrame:
+    sub = df[
+        (df["variable"] == var)
+        & (df["station_type"] == station_type)
+        & (df["depth_bin_low"] == depth_bin.low)
+        & (df["depth_bin_high"] == depth_bin.high)
     ].copy()
     return sub.sort_values(["month"])
 
@@ -435,8 +454,8 @@ def _hover_text_month(sub: pd.DataFrame) -> list[str]:
     ]
 
 
-def _fig_month_on_x(var: str, station_type: str, depth_bin: DepthBin) -> tuple[go.Figure, str]:
-    sub = _subset_month_on_x(var, station_type, depth_bin)
+def _fig_month_on_x(df: pd.DataFrame, months: list[int], var: str, station_type: str, depth_bin: DepthBin) -> tuple[go.Figure, str]:
+    sub = _subset_month_on_x(df, var, station_type, depth_bin)
     title = f"{var} | {station_type} | depth={depth_bin.label}"
 
     if sub.empty:
@@ -465,7 +484,7 @@ def _fig_month_on_x(var: str, station_type: str, depth_bin: DepthBin) -> tuple[g
     fig.update_layout(
         title=title,
         xaxis_title="month",
-        xaxis=dict(type="category", categoryorder="array", categoryarray=MONTHS),
+        xaxis=dict(type="category", categoryorder="array", categoryarray=months),
         yaxis_title=var,
         template="plotly_white",
         height=600,
@@ -770,26 +789,32 @@ app = Dash(__name__)
 app.title = "CTD stats (Dash)"
 server = app.server
 
-init_var = VARIABLES[0] if VARIABLES else None
-init_station = STATION_TYPES[0] if STATION_TYPES else None
-init_month = MONTHS[0] if MONTHS else None
+init_stats_file = DEFAULT_STATS_FILE
+init_df = _get_stats_df(init_stats_file)
+init_variables, init_station_types, init_months = _stats_meta(init_df)
 
-init_bins = _depth_bin_options(init_var, init_station) if init_var and init_station else []
+init_var = init_variables[0] if init_variables else None
+init_station = init_station_types[0] if init_station_types else None
+init_month = init_months[0] if init_months else None
+
+init_bins = _depth_bin_options(init_df, init_var, init_station) if init_var and init_station else []
 init_depth = init_bins[0].value if init_bins else None
 
 if init_var and init_station and init_month is not None:
-    init_fig1, init_status1 = _fig_depth_on_x(init_var, init_station, int(init_month))
+    init_fig1, init_status1 = _fig_depth_on_x(init_df, init_var, init_station, int(init_month))
 else:
     init_fig1, init_status1 = go.Figure(), "No data loaded."
 
 init_depth_options = [{"label": b.label, "value": b.value} for b in init_bins]
 if init_var and init_station and init_depth:
-    init_fig2, init_status2 = _fig_month_on_x(init_var, init_station, DepthBin.from_value(init_depth))
+    init_fig2, init_status2 = _fig_month_on_x(
+        init_df, init_months, init_var, init_station, DepthBin.from_value(init_depth)
+    )
 else:
     init_fig2, init_status2 = go.Figure(), ""
 
 if init_var and init_station and init_depth:
-    _sub_init3 = _subset_month_on_x(init_var, init_station, DepthBin.from_value(init_depth))
+    _sub_init3 = _subset_month_on_x(init_df, init_var, init_station, DepthBin.from_value(init_depth))
     init_fig3, init_status3 = _add_fixed_season_limits(init_fig2, _sub_init3)
 else:
     init_fig3, init_status3 = go.Figure(), ""
@@ -802,7 +827,23 @@ app.layout = html.Div(
         html.H2("Interactive CTD depth-bin boxplots (Dash)"),
         html.Div(
             [
-                html.Div(["CSV: ", html.Code(str(CSV_PATH.name))]),
+                html.Div(
+                    style={"display": "grid", "gridTemplateColumns": "1fr 2fr", "gap": "10px", "alignItems": "end"},
+                    children=[
+                        html.Div(
+                            [
+                                html.Div("stats file", style={"fontWeight": 600}),
+                                dcc.Dropdown(
+                                    id="stats-file",
+                                    options=[{"label": p.name, "value": p.name} for p in STATS_PATHS],
+                                    value=init_stats_file,
+                                    clearable=False,
+                                ),
+                            ]
+                        ),
+                        html.Div(["Using: ", html.Code(init_stats_file)], id="stats-file-label"),
+                    ],
+                ),
                 html.Div(
                     [
                         "Expected columns: ",
@@ -846,7 +887,7 @@ app.layout = html.Div(
                                         html.Div("variable", style={"fontWeight": 600}),
                                         dcc.Dropdown(
                                             id="var1",
-                                            options=[{"label": v, "value": v} for v in VARIABLES],
+                                            options=[{"label": v, "value": v} for v in init_variables],
                                             value=init_var,
                                             clearable=False,
                                         ),
@@ -857,7 +898,7 @@ app.layout = html.Div(
                                         html.Div("station_type", style={"fontWeight": 600}),
                                         dcc.Dropdown(
                                             id="station1",
-                                            options=[{"label": s, "value": s} for s in STATION_TYPES],
+                                            options=[{"label": s, "value": s} for s in init_station_types],
                                             value=init_station,
                                             clearable=False,
                                         ),
@@ -868,7 +909,7 @@ app.layout = html.Div(
                                         html.Div("month", style={"fontWeight": 600}),
                                         dcc.Dropdown(
                                             id="month1",
-                                            options=[{"label": str(m), "value": int(m)} for m in MONTHS],
+                                            options=[{"label": str(m), "value": int(m)} for m in init_months],
                                             value=init_month,
                                             clearable=False,
                                         ),
@@ -902,7 +943,7 @@ app.layout = html.Div(
                                         html.Div("variable", style={"fontWeight": 600}),
                                         dcc.Dropdown(
                                             id="var2",
-                                            options=[{"label": v, "value": v} for v in VARIABLES],
+                                            options=[{"label": v, "value": v} for v in init_variables],
                                             value=init_var,
                                             clearable=False,
                                         ),
@@ -913,7 +954,7 @@ app.layout = html.Div(
                                         html.Div("station_type", style={"fontWeight": 600}),
                                         dcc.Dropdown(
                                             id="station2",
-                                            options=[{"label": s, "value": s} for s in STATION_TYPES],
+                                            options=[{"label": s, "value": s} for s in init_station_types],
                                             value=init_station,
                                             clearable=False,
                                         ),
@@ -969,7 +1010,7 @@ app.layout = html.Div(
                                         html.Div("variable", style={"fontWeight": 600}),
                                         dcc.Dropdown(
                                             id="var3",
-                                            options=[{"label": v, "value": v} for v in VARIABLES],
+                                            options=[{"label": v, "value": v} for v in init_variables],
                                             value=init_var,
                                             clearable=False,
                                         ),
@@ -980,7 +1021,7 @@ app.layout = html.Div(
                                         html.Div("station_type", style={"fontWeight": 600}),
                                         dcc.Dropdown(
                                             id="station3",
-                                            options=[{"label": s, "value": s} for s in STATION_TYPES],
+                                            options=[{"label": s, "value": s} for s in init_station_types],
                                             value=init_station,
                                             clearable=False,
                                         ),
@@ -1012,10 +1053,88 @@ app.layout = html.Div(
     ],
 )
 
+@app.callback(Output("stats-file-label", "children"), Input("stats-file", "value"))
+def _update_stats_file_label(stats_file: str):
+    return ["Using: ", html.Code(str(stats_file))]
 
-@app.callback(Output("fig1", "figure"), Output("status1", "children"), Input("var1", "value"), Input("station1", "value"), Input("month1", "value"))
-def _update_fig1(var: str, station_type: str, month: int):
-    fig, status = _fig_depth_on_x(var, station_type, int(month))
+
+@app.callback(
+    Output("var1", "options"),
+    Output("var1", "value"),
+    Output("station1", "options"),
+    Output("station1", "value"),
+    Output("month1", "options"),
+    Output("month1", "value"),
+    Output("var2", "options"),
+    Output("var2", "value"),
+    Output("station2", "options"),
+    Output("station2", "value"),
+    Output("var3", "options"),
+    Output("var3", "value"),
+    Output("station3", "options"),
+    Output("station3", "value"),
+    Input("stats-file", "value"),
+    State("var1", "value"),
+    State("station1", "value"),
+    State("month1", "value"),
+    State("var2", "value"),
+    State("station2", "value"),
+    State("var3", "value"),
+    State("station3", "value"),
+)
+def _sync_dropdown_options_for_stats_file(
+    stats_file: str,
+    var1: str | None,
+    station1: str | None,
+    month1: int | None,
+    var2: str | None,
+    station2: str | None,
+    var3: str | None,
+    station3: str | None,
+):
+    df = _get_stats_df(stats_file)
+    variables, station_types, months = _stats_meta(df)
+
+    def pick(current, options):
+        return current if current in options else (options[0] if options else None)
+
+    v1 = pick(var1, variables)
+    s1 = pick(station1, station_types)
+    m1 = pick(int(month1) if month1 is not None else None, months)
+    v2 = pick(var2, variables)
+    s2 = pick(station2, station_types)
+    v3 = pick(var3, variables)
+    s3 = pick(station3, station_types)
+
+    return (
+        [{"label": v, "value": v} for v in variables],
+        v1,
+        [{"label": s, "value": s} for s in station_types],
+        s1,
+        [{"label": str(m), "value": int(m)} for m in months],
+        m1,
+        [{"label": v, "value": v} for v in variables],
+        v2,
+        [{"label": s, "value": s} for s in station_types],
+        s2,
+        [{"label": v, "value": v} for v in variables],
+        v3,
+        [{"label": s, "value": s} for s in station_types],
+        s3,
+    )
+
+
+@app.callback(
+    Output("fig1", "figure"),
+    Output("status1", "children"),
+    Input("stats-file", "value"),
+    Input("var1", "value"),
+    Input("station1", "value"),
+    Input("month1", "value"),
+)
+def _update_fig1(stats_file: str, var: str, station_type: str, month: int):
+    df = _get_stats_df(stats_file)
+    fig, status = _fig_depth_on_x(df, var, station_type, int(month))
     return fig, status
 
 
@@ -1024,13 +1143,16 @@ def _update_fig1(var: str, station_type: str, month: int):
     Output("depth2", "value"),
     Output("fig2", "figure"),
     Output("status2", "children"),
+    Input("stats-file", "value"),
     Input("var2", "value"),
     Input("station2", "value"),
     Input("depth2", "value"),
     Input("seasons2", "value"),
 )
-def _update_fig2(var: str, station_type: str, depth_value: str | None, seasons: int):
-    bins = _depth_bin_options(var, station_type)
+def _update_fig2(stats_file: str, var: str, station_type: str, depth_value: str | None, seasons: int):
+    df = _get_stats_df(stats_file)
+    _, _, months = _stats_meta(df)
+    bins = _depth_bin_options(df, var, station_type)
     options = [{"label": b.label, "value": b.value} for b in bins]
 
     if not bins:
@@ -1048,10 +1170,10 @@ def _update_fig2(var: str, station_type: str, depth_value: str | None, seasons: 
         depth_value = bins[0].value
 
     depth_bin = DepthBin.from_value(depth_value)
-    fig, status = _fig_month_on_x(var, station_type, depth_bin)
+    fig, status = _fig_month_on_x(df, months, var, station_type, depth_bin)
 
     # Add seasonal lower/upper limits that cover q1/q3 (p01/p99) and minimize slack.
-    sub = _subset_month_on_x(var, station_type, depth_bin)
+    sub = _subset_month_on_x(df, var, station_type, depth_bin)
     fig2, season_status = _add_season_limits(fig, sub, seasons=seasons or 1)
     combined_status = season_status or status
     if status and season_status:
@@ -1064,12 +1186,15 @@ def _update_fig2(var: str, station_type: str, depth_value: str | None, seasons: 
     Output("depth3", "value"),
     Output("fig3", "figure"),
     Output("status3", "children"),
+    Input("stats-file", "value"),
     Input("var3", "value"),
     Input("station3", "value"),
     Input("depth3", "value"),
 )
-def _update_fig3(var: str, station_type: str, depth_value: str | None):
-    bins = _depth_bin_options(var, station_type)
+def _update_fig3(stats_file: str, var: str, station_type: str, depth_value: str | None):
+    df = _get_stats_df(stats_file)
+    _, _, months = _stats_meta(df)
+    bins = _depth_bin_options(df, var, station_type)
     options = [{"label": b.label, "value": b.value} for b in bins]
 
     if not bins:
@@ -1087,8 +1212,8 @@ def _update_fig3(var: str, station_type: str, depth_value: str | None):
         depth_value = bins[0].value
 
     depth_bin = DepthBin.from_value(depth_value)
-    fig, status = _fig_month_on_x(var, station_type, depth_bin)
-    sub = _subset_month_on_x(var, station_type, depth_bin)
+    fig, status = _fig_month_on_x(df, months, var, station_type, depth_bin)
+    sub = _subset_month_on_x(df, var, station_type, depth_bin)
     fig3, limits_status = _add_fixed_season_limits(fig, sub)
     combined_status = limits_status or status
     if status and limits_status:
