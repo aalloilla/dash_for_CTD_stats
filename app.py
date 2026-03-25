@@ -87,7 +87,10 @@ def _stats_meta(df: pd.DataFrame) -> tuple[list[str], list[str], list[int]]:
     months = sorted(df["month"].dropna().unique().astype(int).tolist())
     return variables, station_types, months
 
-STATIONS_CSV = HERE / "Station_Mean_Coords.csv"
+STATIONS_CSV = HERE / "Complete_Station_Mean_Coords.csv"
+if not STATIONS_CSV.exists():
+    # Backward-compatible fallback
+    STATIONS_CSV = HERE / "Station_Mean_Coords.csv"
 POLYGON_GEOJSON_PATH = HERE / "polygon_shallow_lte15m_SouthFlorida.geojson"
 STATION_CLASSIFICATION_JSON = HERE / "station_depth_classification.json"
 
@@ -104,6 +107,20 @@ def _load_stations(csv_path: Path) -> pd.DataFrame:
     df["lon_mean"] = pd.to_numeric(df["lon_mean"], errors="coerce")
     df["station"] = df["station"].astype(str)
     df = df.dropna(subset=["lat_mean", "lon_mean", "station"])
+
+    # Heuristic fix for occasional swapped lon/lat rows.
+    # Most stations here are expected to be in the N hemisphere and W longitudes.
+    lat_med = float(df["lat_mean"].median())
+    lon_med = float(df["lon_mean"].median())
+    expected_lat_positive = lat_med >= 0
+    expected_lon_negative = lon_med <= 0
+
+    lat = df["lat_mean"]
+    lon = df["lon_mean"]
+    looks_swapped = ((lat < 0) == expected_lat_positive) & ((lon > 0) == expected_lon_negative)
+    if looks_swapped.any():
+        df.loc[looks_swapped, ["lat_mean", "lon_mean"]] = df.loc[looks_swapped, ["lon_mean", "lat_mean"]].to_numpy()
+
     return df
 
 
