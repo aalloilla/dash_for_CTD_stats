@@ -87,10 +87,14 @@ def _stats_meta(df: pd.DataFrame) -> tuple[list[str], list[str], list[int]]:
     months = sorted(df["month"].dropna().unique().astype(int).tolist())
     return variables, station_types, months
 
-STATIONS_CSV = HERE / "Complete_Station_Mean_Coords.csv"
+STATIONS_CSV = HERE / "Complete_Station_Mean_Coords_with_depth.csv"
 if not STATIONS_CSV.exists():
-    # Backward-compatible fallback
-    STATIONS_CSV = HERE / "Station_Mean_Coords.csv"
+    # Backward-compatible fallbacks
+    for _fallback in ("Complete_Station_Mean_Coords.csv", "Station_Mean_Coords.csv"):
+        p = HERE / _fallback
+        if p.exists():
+            STATIONS_CSV = p
+            break
 POLYGON_GEOJSON_PATH = HERE / "polygon_shallow_lte15m_SouthFlorida.geojson"
 STATION_CLASSIFICATION_JSON = HERE / "station_depth_classification.json"
 
@@ -105,6 +109,10 @@ def _load_stations(csv_path: Path) -> pd.DataFrame:
     df = df.copy()
     df["lat_mean"] = pd.to_numeric(df["lat_mean"], errors="coerce")
     df["lon_mean"] = pd.to_numeric(df["lon_mean"], errors="coerce")
+    if "depth_m" in df.columns:
+        df["depth_m"] = pd.to_numeric(df["depth_m"], errors="coerce")
+    else:
+        df["depth_m"] = pd.NA
     df["station"] = df["station"].astype(str)
     df = df.dropna(subset=["lat_mean", "lon_mean", "station"])
 
@@ -279,7 +287,8 @@ def _fig_station_map() -> tuple[go.Figure, str]:
                 mode="markers",
                 marker=dict(size=8, color="rgba(120, 120, 120, 0.75)"),
                 text=outside["station"].tolist(),
-                hovertemplate="Station %{text}<br>Outside polygon<br>(%{lat:.4f}, %{lon:.4f})<extra></extra>",
+                customdata=outside[["depth_m"]].to_numpy(),
+                hovertemplate="Station %{text}<br>Outside polygon<br>depth=%{customdata[0]:.2f} m<br>(%{lat:.4f}, %{lon:.4f})<extra></extra>",
                 name="Stations (outside)",
             )
         )
@@ -292,7 +301,8 @@ def _fig_station_map() -> tuple[go.Figure, str]:
                 mode="markers",
                 marker=dict(size=10, color="rgba(220, 20, 60, 0.92)"),
                 text=inside["station"].tolist(),
-                hovertemplate="Station %{text}<br><b>Inside polygon</b><br>(%{lat:.4f}, %{lon:.4f})<extra></extra>",
+                customdata=inside[["depth_m"]].to_numpy(),
+                hovertemplate="Station %{text}<br><b>Inside polygon</b><br>depth=%{customdata[0]:.2f} m<br>(%{lat:.4f}, %{lon:.4f})<extra></extra>",
                 name="Stations (inside)",
             )
         )
