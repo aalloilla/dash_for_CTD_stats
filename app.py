@@ -740,7 +740,8 @@ def _compute_depth_limit_rows_all_months(
         "lower",
         "upper",
     ]
-    if str(station_type or "").lower() != "deep_cast":
+    # Support deep + shallow casts (shallow uses 1 category; deep may use N).
+    if str(station_type or "").lower() not in {"deep_cast", "shallow_cast"}:
         return [], cols
 
     rows: list[dict] = []
@@ -1136,9 +1137,6 @@ def _compute_depth_limit_rows(
         "lower",
         "upper",
     ]
-
-    if str(station_type or "").lower() != "deep_cast":
-        return [], cols
 
     sub2 = sub.dropna(subset=["depth_bin_low", "depth_bin_high", "p01", "p99"]).copy()
     if sub2.empty:
@@ -1856,38 +1854,68 @@ def _update_fig1(
 ):
     df = _get_stats_df(stats_file)
     fig, status = _fig_depth_on_x(df, var, station_type, int(month))
-    if str(station_type).lower() != "deep_cast":
-        rows, cols = _compute_depth_limit_rows(stats_file, var, station_type, month, depth_categories or 1, pd.DataFrame())
-        text = "Depth limits are only generated for station_type=deep_cast.\n"
-        return fig, status, text, {"rows": rows, "columns": cols}
-
     sub = _subset_depth_on_x(df, var, station_type, int(month))
-    locked, locked_segments = _locked_depthbins(lock_depth_value, lock_data)
-    fig2, depth_status = _add_depth_category_limits(fig, sub, categories=depth_categories or 1, locked_segments=locked_segments)
+    station_key = str(station_type or "").lower()
 
-    if locked and locked_segments:
-        _vars, _stations, months = _stats_meta(df)
-        rows, cols = _compute_depth_limit_rows_all_months(
-            stats_file,
-            var,
-            station_type,
-            months,
-            depth_categories or 1,
-            df,
+    # Requirement: shallow_cast should show a single set of limits.
+    if station_key == "deep_cast":
+        locked, locked_segments = _locked_depthbins(lock_depth_value, lock_data)
+        fig2, depth_status = _add_depth_category_limits(
+            fig,
+            sub,
+            categories=depth_categories or 1,
             locked_segments=locked_segments,
         )
-        text = _format_tsv(rows, cols) if rows else "No depth-limit rows (all months) for this locked selection.\n"
+
+        if locked and locked_segments:
+            _vars, _stations, months = _stats_meta(df)
+            rows, cols = _compute_depth_limit_rows_all_months(
+                stats_file,
+                var,
+                station_type,
+                months,
+                depth_categories or 1,
+                df,
+                locked_segments=locked_segments,
+            )
+            text = _format_tsv(rows, cols) if rows else "No depth-limit rows (all months) for this locked selection.\n"
+        else:
+            rows, cols = _compute_depth_limit_rows(
+                stats_file,
+                var,
+                station_type,
+                month,
+                depth_categories or 1,
+                sub,
+                locked_segments=None,
+            )
+            text = _format_tsv(rows, cols) if rows else "No depth-limit segments for this selection.\n"
     else:
-        rows, cols = _compute_depth_limit_rows(
-            stats_file,
-            var,
-            station_type,
-            month,
-            depth_categories or 1,
-            sub,
-            locked_segments=None,
-        )
-        text = _format_tsv(rows, cols) if rows else "No depth-limit segments for this selection.\n"
+        # Non-deep (including shallow_cast): force 1 category => one lower + one upper limit.
+        fig2, depth_status = _add_depth_category_limits(fig, sub, categories=1, locked_segments=None)
+        if station_key == "shallow_cast":
+            _vars, _stations, months = _stats_meta(df)
+            rows, cols = _compute_depth_limit_rows_all_months(
+                stats_file,
+                var,
+                station_type,
+                months,
+                1,
+                df,
+                locked_segments=[],
+            )
+            text = _format_tsv(rows, cols) if rows else "No depth-limit rows (all months) for this selection.\n"
+        else:
+            rows, cols = _compute_depth_limit_rows(
+                stats_file,
+                var,
+                station_type,
+                month,
+                1,
+                sub,
+                locked_segments=None,
+            )
+            text = _format_tsv(rows, cols) if rows else "No depth-limit segments for this selection.\n"
 
     combined_status = depth_status or status
     if status and depth_status:
@@ -1921,6 +1949,7 @@ def _update_fig2(
 ):
     df = _get_stats_df(stats_file)
     _, _, months = _stats_meta(df)
+    station_key = str(station_type or "").lower()
     bins = _depth_bin_options(df, var, station_type)
     options = [{"label": b.label, "value": b.value} for b in bins]
 
@@ -1956,9 +1985,17 @@ def _update_fig2(
     # Add seasonal lower/upper limits that cover q1/q3 (p01/p99) and minimize slack.
     sub = _subset_month_on_x(df, var, station_type, depth_bin)
     locked, locked_groups = _locked_seasons(lock_seasons_value, lock_data)
+
+    # Requirement:
+    # - deep_cast: if seasons are locked, write out all depth-bin groups (all depth bins)
+    # - shallow_cast: just one depth-bin group (the currently selected depth bin), for both textbox + CSV
+    if station_key == "shallow_cast":
+        locked = False
+        locked_groups = None
+
     fig2, season_status = _add_season_limits(fig, sub, seasons=seasons or 1, locked_groups=locked_groups)
 
-    if locked and locked_groups:
+    if station_key == "deep_cast" and locked and locked_groups:
         rows, cols = _compute_season_limit_rows_all_depth_bins(
             stats_file,
             var,
@@ -2034,20 +2071,28 @@ def _update_fig3(stats_file: str, var: str, station_type: str, depth_value: str 
     Input("depthbins-lock-store", "data"),
 )
 def _disable_append_depth_limits(station_type: str | None, lock_value: list[str] | None, lock_data: dict | None) -> bool:
-    if str(station_type or "").lower() != "deep_cast":
-        return True
-    locked, locked_segments = _locked_depthbins(lock_value, lock_data)
-    return not (locked and locked_segments)
+    # Allow writing for shallow/deep; for deep_cast, the button is primarily useful when locked
+    # (exports all months), but we also allow it unlocked (exports current month selection).
+    st = str(station_type or "").lower()
+    if st in {"deep_cast", "shallow_cast"}:
+        return False
+    return True
 
 
 @app.callback(
     Output("append-season-limits", "disabled"),
+    Input("station2", "value"),
     Input("lock-seasons", "value"),
     Input("seasons-lock-store", "data"),
 )
-def _disable_append_season_limits(lock_value: list[str] | None, lock_data: dict | None) -> bool:
-    locked, locked_groups = _locked_seasons(lock_value, lock_data)
-    return not (locked and locked_groups)
+def _disable_append_season_limits(station_type: str | None, lock_value: list[str] | None, lock_data: dict | None) -> bool:
+    st = str(station_type or "").lower()
+    if st == "shallow_cast":
+        return False
+    if st == "deep_cast":
+        locked, locked_groups = _locked_seasons(lock_value, lock_data)
+        return not (locked and locked_groups)
+    return True
 
 
 @app.callback(
@@ -2057,6 +2102,7 @@ def _disable_append_season_limits(lock_value: list[str] | None, lock_data: dict 
     State("lock-depth-bins", "value"),
     State("depthbins-lock-store", "data"),
     State("var1", "value"),
+    State("station1", "value"),
     prevent_initial_call=True,
 )
 def _append_depth_limits(
@@ -2065,19 +2111,22 @@ def _append_depth_limits(
     lock_value: list[str] | None,
     lock_data: dict | None,
     var: str | None,
+    station_type: str | None,
 ):
     locked, locked_segments = _locked_depthbins(lock_value, lock_data)
-    if not (locked and locked_segments):
-        return "Lock depth bins to append."
     if not data:
         return "No limits to append."
     rows = data.get("rows") or []
     cols = data.get("columns") or []
     if not rows:
         return "No limits to append."
-    out_path = HERE / f"depthbin_limits_{_safe_filename_component(var)}.csv"
+    out_path = HERE / (
+        f"depthbin_limits_{_safe_filename_component(var)}_{_safe_filename_component(station_type)}.csv"
+    )
     n = _append_rows_to_csv(out_path, rows, cols)
-    return f"Wrote {n} row(s) to {out_path.name}"
+    if locked and locked_segments:
+        return f"Wrote {n} row(s) to {out_path.name}"
+    return f"Wrote {n} row(s) to {out_path.name} (current selection)"
 
 
 @app.callback(
@@ -2087,6 +2136,7 @@ def _append_depth_limits(
     State("lock-seasons", "value"),
     State("seasons-lock-store", "data"),
     State("var2", "value"),
+    State("station2", "value"),
     prevent_initial_call=True,
 )
 def _append_season_limits(
@@ -2095,17 +2145,21 @@ def _append_season_limits(
     lock_value: list[str] | None,
     lock_data: dict | None,
     var: str | None,
+    station_type: str | None,
 ):
+    st = str(station_type or "").lower()
     locked, locked_groups = _locked_seasons(lock_value, lock_data)
-    if not (locked and locked_groups):
-        return "Lock seasons to append."
+    if st == "deep_cast" and not (locked and locked_groups):
+        return "For deep_cast, lock seasons to append all depth bins."
     if not data:
         return "No limits to append."
     rows = data.get("rows") or []
     cols = data.get("columns") or []
     if not rows:
         return "No limits to append."
-    out_path = HERE / f"season_limits_{_safe_filename_component(var)}.csv"
+    out_path = HERE / (
+        f"season_limits_{_safe_filename_component(var)}_{_safe_filename_component(station_type)}.csv"
+    )
     n = _append_rows_to_csv(out_path, rows, cols)
     return f"Wrote {n} row(s) to {out_path.name}"
 
