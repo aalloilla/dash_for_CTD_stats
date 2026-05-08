@@ -20,6 +20,28 @@ if not STATS_PATHS:
 
 DEFAULT_STATS_FILE = STATS_PATHS[0].name
 
+SHALLOW_LIMITS_FILE_GLOB = "season_limits_*_shallow_cast.csv"
+SHALLOW_COMBINED_LIMITS_FILE = "season_limits_shallow_cast_combined.csv"
+DEFAULT_DEEP_GROUP_BREAKS = (40.0, 120.0, 210.0)
+DEFAULT_DEEP_G1_S1 = "11,12,1,2,3,4"
+DEFAULT_DEEP_G1_S2 = "5,6,7,8,9,10"
+DEFAULT_DEEP_G2_S1 = "2,3,4,5,6"
+DEFAULT_DEEP_G2_S2 = "7,8,9,10,11,12,1"
+DEFAULT_DEEP_G3_S1 = "9,10,11,12,1,2,3,4,5,6"
+DEFAULT_DEEP_G3_S2 = "7,8"
+SHALLOW_LIMITS_REQUIRED_COLS = {
+    "stats_file",
+    "variable",
+    "station_type",
+    "depth_bin_low",
+    "depth_bin_high",
+    "seasons",
+    "season_index",
+    "months",
+    "lower",
+    "upper",
+}
+
 
 REQUIRED_COLS = {
     "variable",
@@ -684,6 +706,18 @@ def _format_tsv(rows: list[dict], columns: list[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _write_rows_to_csv(path: Path, rows: list[dict], columns: list[str]) -> int:
+    if not rows or not columns:
+        return 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=columns)
+        w.writeheader()
+        for r in rows:
+            w.writerow({c: r.get(c) for c in columns})
+    return len(rows)
+
+
 def _append_rows_to_csv(path: Path, rows: list[dict], columns: list[str]) -> int:
     if not rows or not columns:
         return 0
@@ -1212,88 +1246,564 @@ def _compute_depth_limit_rows(
     return rows, cols
 
 
-def _fixed_season_limits(sub: pd.DataFrame) -> tuple[SeasonSegment | None, SeasonSegment | None]:
-    """
-    Fixed seasons:
-      - Season A: months 12 through 5 (wrap) => {12,1,2,3,4,5}
-      - Season B: months 6 through 11        => {6,7,8,9,10,11}
-    Limits cover q1/q3 where q1=p01 and q3=p99.
-    """
+def _shallow_limits_paths() -> list[Path]:
+    return sorted(HERE.glob(SHALLOW_LIMITS_FILE_GLOB))
+
+
+def _load_shallow_limits_df(csv_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    missing = SHALLOW_LIMITS_REQUIRED_COLS - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV is missing required columns: {sorted(missing)}")
+
+    df = df.copy()
+    for c in ["depth_bin_low", "depth_bin_high", "lower", "upper"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in ["seasons", "season_index"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+    for c in ["stats_file", "variable", "station_type", "months"]:
+        df[c] = df[c].astype(str)
+
+    df = df[df["station_type"].str.lower() == "shallow_cast"].copy()
+    df = df.dropna(
+        subset=[
+            "stats_file",
+            "variable",
+            "station_type",
+            "depth_bin_low",
+            "depth_bin_high",
+            "seasons",
+            "season_index",
+            "months",
+            "lower",
+            "upper",
+        ]
+    )
+    if df.empty:
+        return df
+
+    df["seasons"] = df["seasons"].astype(int)
+    df["season_index"] = df["season_index"].astype(int)
+    return df.sort_values(["season_index", "depth_bin_low", "depth_bin_high"])
+
+
+def _combine_shallow_limits_rows(source_file: str, df: pd.DataFrame) -> tuple[list[dict], list[str]]:
+    cols = [
+        "source_file",
+        "stats_file",
+        "variable",
+        "station_type",
+        "seasons",
+        "season_index",
+        "months",
+        "depth_bin_count",
+        "depth_bin_low",
+        "depth_bin_high",
+        "suggested_lower",
+        "suggested_upper",
+    ]
+    if df.empty:
+        return [], cols
+
+    grouped = (
+        df.groupby(["stats_file", "variable", "station_type", "seasons", "season_index", "months"], dropna=False)
+        .agg(
+            depth_bin_count=("depth_bin_low", "size"),
+            depth_bin_low=("depth_bin_low", "min"),
+            depth_bin_high=("depth_bin_high", "max"),
+            suggested_lower=("lower", "min"),
+            suggested_upper=("upper", "max"),
+        )
+        .reset_index()
+        .sort_values(["season_index", "depth_bin_low", "depth_bin_high"])
+    )
+
+    rows: list[dict] = []
+    for r in grouped.to_dict("records"):
+        rows.append(
+            {
+                "source_file": source_file,
+                "stats_file": r["stats_file"],
+                "variable": r["variable"],
+                "station_type": r["station_type"],
+                "seasons": int(r["seasons"]),
+                "season_index": int(r["season_index"]),
+                "months": r["months"],
+                "depth_bin_count": int(r["depth_bin_count"]),
+                "depth_bin_low": float(r["depth_bin_low"]),
+                "depth_bin_high": float(r["depth_bin_high"]),
+                "suggested_lower": float(r["suggested_lower"]),
+                "suggested_upper": float(r["suggested_upper"]),
+            }
+        )
+    return rows, cols
+
+
+def _empty_shallow_limits_review_figure(title: str) -> go.Figure:
+    fig = go.Figure()
+    fig.update_layout(
+        title=title,
+        template="plotly_white",
+        height=600,
+        margin=dict(l=60, r=30, t=60, b=60),
+    )
+    return fig
+
+
+def _review_shallow_limits(csv_file: str | None) -> tuple[go.Figure, str, str]:
+    title = "Shallow-cast season-limit review"
+    combined_cols = [
+        "source_file",
+        "stats_file",
+        "variable",
+        "station_type",
+        "seasons",
+        "season_index",
+        "months",
+        "depth_bin_count",
+        "depth_bin_low",
+        "depth_bin_high",
+        "suggested_lower",
+        "suggested_upper",
+    ]
+
+    if not csv_file:
+        return (
+            _empty_shallow_limits_review_figure(title + " (no file selected)"),
+            "No shallow season-limit CSV selected.",
+            _format_tsv([], combined_cols),
+        )
+
+    path = HERE / csv_file
+    if not path.exists():
+        return (
+            _empty_shallow_limits_review_figure(title + " (missing file)"),
+            f"Could not find {csv_file}.",
+            _format_tsv([], combined_cols),
+        )
+
+    try:
+        df = _load_shallow_limits_df(path)
+    except Exception as e:
+        return (
+            _empty_shallow_limits_review_figure(title + " (invalid file)"),
+            f"Could not read {csv_file}: {type(e).__name__}: {e}",
+            _format_tsv([], combined_cols),
+        )
+
+    if df.empty:
+        return (
+            _empty_shallow_limits_review_figure(title + " (no shallow rows)"),
+            f"{csv_file} has no shallow-cast season-limit rows.",
+            _format_tsv([], combined_cols),
+        )
+
+    bins = (
+        df[["depth_bin_low", "depth_bin_high"]]
+        .drop_duplicates()
+        .sort_values(["depth_bin_low", "depth_bin_high"])
+        .itertuples(index=False, name=None)
+    )
+    x_lookup = {(float(low), float(high)): f"{float(low):g}–{float(high):g}" for low, high in bins}
+    xlabels = list(x_lookup.values())
+
+    fig = _empty_shallow_limits_review_figure(f"{title} | {csv_file}")
+    fig.update_layout(
+        xaxis_title="depth bin (m)",
+        xaxis=dict(type="category", categoryorder="array", categoryarray=xlabels),
+        yaxis_title=str(df["variable"].iloc[0]),
+    )
+
+    palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+    grouped_rows, grouped_cols = _combine_shallow_limits_rows(csv_file, df)
+    combined_text = _format_tsv(grouped_rows, grouped_cols)
+
+    for i, ((season_index, months_text), seg) in enumerate(df.groupby(["season_index", "months"], sort=True)):
+        seg = seg.sort_values(["depth_bin_low", "depth_bin_high"])
+        color = palette[i % len(palette)]
+        x = [x_lookup[(float(r.depth_bin_low), float(r.depth_bin_high))] for r in seg.itertuples(index=False)]
+        lower_vals = seg["lower"].astype(float).tolist()
+        upper_vals = seg["upper"].astype(float).tolist()
+        season_name = f"Season {int(season_index)} ({months_text})"
+
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=lower_vals,
+                mode="lines+markers",
+                line=dict(color=color, width=2, dash="dot"),
+                marker=dict(size=7),
+                name=f"{season_name} lower",
+                legendgroup=f"review-season-{int(season_index)}",
+                hovertemplate=(
+                    f"{season_name}<br>depth=%{{x}} m<br>lower=%{{y:.4g}}<br>"
+                    "per-depth lower limit<extra></extra>"
+                ),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=upper_vals,
+                mode="lines+markers",
+                line=dict(color=color, width=2),
+                marker=dict(size=7),
+                name=f"{season_name} upper",
+                legendgroup=f"review-season-{int(season_index)}",
+                hovertemplate=(
+                    f"{season_name}<br>depth=%{{x}} m<br>upper=%{{y:.4g}}<br>"
+                    "per-depth upper limit<extra></extra>"
+                ),
+            )
+        )
+
+    for i, row in enumerate(grouped_rows):
+        color = palette[i % len(palette)]
+        season_name = f"Season {row['season_index']} suggested ({row['months']})"
+        fig.add_trace(
+            go.Scatter(
+                x=xlabels,
+                y=[row["suggested_lower"]] * len(xlabels),
+                mode="lines",
+                line=dict(color=color, width=3, dash="dash"),
+                name=f"{season_name} lower",
+                legendgroup=f"suggested-season-{row['season_index']}",
+                hovertemplate=(
+                    f"{season_name}<br>all shallow depth bins<br>"
+                    f"lower={row['suggested_lower']:.4g}<extra></extra>"
+                ),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=xlabels,
+                y=[row["suggested_upper"]] * len(xlabels),
+                mode="lines",
+                line=dict(color=color, width=3, dash="dash"),
+                name=f"{season_name} upper",
+                legendgroup=f"suggested-season-{row['season_index']}",
+                hovertemplate=(
+                    f"{season_name}<br>all shallow depth bins<br>"
+                    f"upper={row['suggested_upper']:.4g}<extra></extra>"
+                ),
+            )
+        )
+
+    suggestion_parts = [
+        (
+            f"S{row['season_index']} ({row['months']}) -> "
+            f"[{row['suggested_lower']:.6g}, {row['suggested_upper']:.6g}]"
+        )
+        for row in grouped_rows
+    ]
+    status = (
+        f"Loaded {len(df)} row(s) from {csv_file} across {len(xlabels)} depth bins. "
+        f"Combined suggestions: {' | '.join(suggestion_parts)}"
+    )
+    return fig, status, combined_text
+
+
+def _deep_station_variables(df: pd.DataFrame) -> list[str]:
+    sub = df[df["station_type"].astype(str).str.lower() == "deep_cast"]
+    return sorted(sub["variable"].dropna().astype(str).unique().tolist())
+
+
+def _parse_month_text(month_text: str | None) -> tuple[list[int], str | None]:
+    raw = str(month_text or "").strip()
+    if not raw:
+        return [], "Season months cannot be empty."
+    tokens = [tok.strip() for tok in raw.split(",") if tok.strip()]
+    months: list[int] = []
+    seen: set[int] = set()
+    for tok in tokens:
+        try:
+            m = int(tok)
+        except ValueError:
+            return [], f"Invalid month token: {tok!r}"
+        if m < 1 or m > 12:
+            return [], f"Month out of range: {m}"
+        if m not in seen:
+            seen.add(m)
+            months.append(m)
+    if not months:
+        return [], "Season months cannot be empty."
+    return months, None
+
+
+def _month_groups_warning(groups: list[list[int]]) -> str | None:
+    seen: set[int] = set()
+    overlap: set[int] = set()
+    for grp in groups:
+        for m in grp:
+            if m in seen:
+                overlap.add(m)
+            seen.add(m)
+    if overlap:
+        return f"Overlapping months detected: {','.join(str(m) for m in sorted(overlap))}."
+    missing = [m for m in range(1, 13) if m not in seen]
+    if missing:
+        return f"Months not assigned to a season: {','.join(str(m) for m in missing)}."
+    return None
+
+
+def _deep_group_rows(
+    stats_file: str,
+    var: str,
+    df: pd.DataFrame,
+    breaks: tuple[float, float, float],
+    month_groups_per_class: list[list[list[int]]],
+) -> tuple[list[dict], list[str], list[str], list[str]]:
+    cols = [
+        "stats_file",
+        "variable",
+        "station_type",
+        "depth_group_index",
+        "depth_group_label",
+        "depth_start_m",
+        "depth_end_m",
+        "seasons",
+        "season_index",
+        "months",
+        "lower",
+        "upper",
+    ]
+    warnings: list[str] = []
+    sub = df[(df["variable"] == var) & (df["station_type"].astype(str).str.lower() == "deep_cast")].copy()
     if sub.empty:
-        return None, None
+        return [], cols, [f"No deep_cast rows found for {var}."], []
 
-    sub2 = sub.dropna(subset=["month", "p01", "p99"]).copy()
-    if sub2.empty:
-        return None, None
+    sub = sub.dropna(subset=["depth_bin_low", "depth_bin_high", "month", "p01", "p99"]).copy()
+    if sub.empty:
+        return [], cols, [f"No usable deep_cast rows found for {var}."], []
+    sub["depth_mid"] = (sub["depth_bin_low"].astype(float) + sub["depth_bin_high"].astype(float)) / 2.0
+    b1, b2, b3 = breaks
 
-    sub2["month"] = sub2["month"].astype(int)
-    season_a = {12, 1, 2, 3, 4, 5}
-    season_b = {6, 7, 8, 9, 10, 11}
+    depth_defs: list[tuple[int, float, float | None, str, pd.DataFrame, list[list[int]]]] = []
+    fixed_defs = [
+        (1, 0.0, b1, f"0-{b1:g} m"),
+        (2, b1, b2, f"{b1:g}-{b2:g} m"),
+        (3, b2, b3, f"{b2:g}-{b3:g} m"),
+    ]
+    for idx, start, end, label in fixed_defs:
+        group_df = sub[(sub["depth_mid"] >= start) & (sub["depth_mid"] < float(end))].copy()
+        depth_defs.append((idx, start, end, label, group_df, month_groups_per_class[idx - 1]))
 
-    def seg(month_set: set[int], start: int, end: int) -> SeasonSegment | None:
-        ss = sub2[sub2["month"].isin(month_set)]
-        if ss.empty:
-            return None
-        low = float(ss["p01"].min())
-        high = float(ss["p99"].max())
-        return SeasonSegment(start_month=start, end_month=end, lower=low, upper=high)
-
-    return seg(season_a, 12, 5), seg(season_b, 6, 11)
-
-
-def _add_fixed_season_limits(fig: go.Figure, sub: pd.DataFrame) -> tuple[go.Figure, str]:
-    a, b = _fixed_season_limits(sub)
-    if not a and not b:
-        return fig, "No data for fixed-season limits."
-
-    def add_segment(seg: SeasonSegment, color: str):
-        # Draw as two blocks if it wraps (12..12 and 1..6).
-        if seg.start_month == 12 and seg.end_month == 5:
-            blocks = [[12], [1, 2, 3, 4, 5]]
+    deep_df = sub[sub["depth_mid"] >= b3].copy()
+    if deep_df.empty:
+        depth_defs.append((4, b3, None, f"{b3:g}+ m", deep_df, [list(range(1, 13))]))
+    else:
+        annual = (
+            deep_df.groupby(["depth_bin_low", "depth_bin_high"], as_index=False)
+            .agg(lower=("p01", "min"), upper=("p99", "max"))
+            .sort_values(["depth_bin_low", "depth_bin_high"])
+        )
+        if len(annual) >= 2:
+            segs_idx, _cost = _optimal_contiguous_segments(
+                annual["lower"].astype(float).tolist(),
+                annual["upper"].astype(float).tolist(),
+                2,
+            )
         else:
-            blocks = [list(range(seg.start_month, seg.end_month + 1))]
+            segs_idx = [(0, len(annual) - 1)]
+            warnings.append(f"{b3:g}+ m: only one depth bin available, so the deepest class could not be split in two.")
+        seg_counter = 0
+        for i, j in segs_idx:
+            if i < 0 or j < 0 or i > j:
+                continue
+            ss = annual.iloc[i : j + 1].copy()
+            if ss.empty:
+                continue
+            seg_counter += 1
+            start = float(ss.iloc[0]["depth_bin_low"])
+            end = float(ss.iloc[-1]["depth_bin_high"])
+            label = f"{start:g}-{end:g} m"
+            segment_df = deep_df[
+                (deep_df["depth_bin_low"] >= start) & (deep_df["depth_bin_high"] <= end)
+            ].copy()
+            depth_defs.append((3 + seg_counter, start, end, label, segment_df, [list(range(1, 13))]))
 
-        for bi, x in enumerate(blocks):
-            fig.add_trace(
-                go.Scatter(
-                    x=x,
-                    y=[seg.lower] * len(x),
-                    mode="lines",
-                    line=dict(color=color, width=2, dash="dash"),
-                    name=f"{seg.start_month}–{seg.end_month} lower",
-                    legendgroup=f"fixed{seg.start_month}-{seg.end_month}",
-                    showlegend=bi == 0,
-                    hovertemplate=f"Fixed season lower<br>months {seg.start_month}–{seg.end_month}<br>y={seg.lower:.4g}<extra></extra>",
+    rows: list[dict] = []
+    xlabels: list[str] = []
+
+    for idx, start, end, label, group_df, season_groups in depth_defs:
+        xlabels.append(label)
+        if group_df.empty:
+            warnings.append(f"{label}: no deep-station rows fall in this depth group.")
+            continue
+
+        for season_idx, season_months in enumerate(season_groups, start=1):
+            ss = group_df[group_df["month"].astype(int).isin([int(m) for m in season_months])].copy()
+            if ss.empty:
+                warnings.append(
+                    f"{label}: no rows found for season {season_idx} months {','.join(str(m) for m in season_months)}."
                 )
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=x,
-                    y=[seg.upper] * len(x),
-                    mode="lines",
-                    line=dict(color=color, width=2, dash="dash"),
-                    name=f"{seg.start_month}–{seg.end_month} upper",
-                    legendgroup=f"fixed{seg.start_month}-{seg.end_month}",
-                    showlegend=False,
-                    hovertemplate=f"Fixed season upper<br>months {seg.start_month}–{seg.end_month}<br>y={seg.upper:.4g}<extra></extra>",
-                )
+                continue
+            rows.append(
+                {
+                    "stats_file": stats_file,
+                    "variable": var,
+                    "station_type": "deep_cast",
+                    "depth_group_index": idx,
+                    "depth_group_label": label,
+                    "depth_start_m": float(start),
+                    "depth_end_m": None if end is None else float(end),
+                    "seasons": len(season_groups),
+                    "season_index": season_idx,
+                    "months": ",".join(str(int(m)) for m in season_months),
+                    "lower": float(ss["p01"].min()),
+                    "upper": float(ss["p99"].max()),
+                }
             )
 
-    if a:
-        add_segment(a, "#7a1fa2")
-    if b:
-        add_segment(b, "#1f9e89")
+    return rows, cols, warnings, xlabels
 
-    parts: list[str] = []
-    if a:
-        parts.append(f"12–5: lower={a.lower:.6g}, upper={a.upper:.6g}")
-    else:
-        parts.append("12–5: (no data)")
-    if b:
-        parts.append(f"6–11: lower={b.lower:.6g}, upper={b.upper:.6g}")
-    else:
-        parts.append("6–11: (no data)")
-    return fig, "Fixed-season limits: " + " | ".join(parts)
+
+def _deep_station_review(
+    stats_file: str,
+    var: str | None,
+    df: pd.DataFrame,
+    break1: float | None,
+    break2: float | None,
+    break3: float | None,
+    g1_s1: str | None,
+    g1_s2: str | None,
+    g2_s1: str | None,
+    g2_s2: str | None,
+    g3_s1: str | None,
+    g3_s2: str | None,
+) -> tuple[go.Figure, str, str, dict]:
+    cols = [
+        "stats_file",
+        "variable",
+        "station_type",
+        "depth_group_index",
+        "depth_group_label",
+        "depth_start_m",
+        "depth_end_m",
+        "seasons",
+        "season_index",
+        "months",
+        "lower",
+        "upper",
+    ]
+    if not var:
+        fig = go.Figure()
+        fig.update_layout(template="plotly_white", height=600, title="Deep-station seasonal review")
+        return fig, "No deep variable selected.", _format_tsv([], cols), {"rows": [], "columns": cols}
+
+    try:
+        b1 = float(break1 if break1 is not None else DEFAULT_DEEP_GROUP_BREAKS[0])
+        b2 = float(break2 if break2 is not None else DEFAULT_DEEP_GROUP_BREAKS[1])
+        b3 = float(break3 if break3 is not None else DEFAULT_DEEP_GROUP_BREAKS[2])
+    except (TypeError, ValueError):
+        fig = go.Figure()
+        fig.update_layout(template="plotly_white", height=600, title=f"Deep-station seasonal review | {var}")
+        return fig, "Depth break values must be numeric.", _format_tsv([], cols), {"rows": [], "columns": cols}
+
+    if not (0 <= b1 < b2 < b3):
+        fig = go.Figure()
+        fig.update_layout(template="plotly_white", height=600, title=f"Deep-station seasonal review | {var}")
+        return (
+            fig,
+            "Depth group boundaries must satisfy 0 <= break1 < break2 < break3.",
+            _format_tsv([], cols),
+            {"rows": [], "columns": cols},
+        )
+
+    season_inputs = [
+        (g1_s1, g1_s2),
+        (g2_s1, g2_s2),
+        (g3_s1, g3_s2),
+    ]
+    month_groups_per_class: list[list[list[int]]] = []
+    warnings: list[str] = []
+    for idx, (s1_text, s2_text) in enumerate(season_inputs, start=1):
+        season1, err1 = _parse_month_text(s1_text)
+        season2, err2 = _parse_month_text(s2_text)
+        if err1 or err2:
+            fig = go.Figure()
+            fig.update_layout(template="plotly_white", height=600, title=f"Deep-station seasonal review | {var}")
+            msg = f"Depth group {idx}: {err1 or err2}"
+            return fig, msg, _format_tsv([], cols), {"rows": [], "columns": cols}
+        group_warning = _month_groups_warning([season1, season2])
+        if group_warning:
+            warnings.append(f"Depth group {idx}: {group_warning}")
+        month_groups_per_class.append([season1, season2])
+
+    rows, cols, row_warnings, xlabels = _deep_group_rows(
+        stats_file, var, df, (b1, b2, b3), month_groups_per_class
+    )
+    warnings.extend(row_warnings)
+
+    fig = go.Figure()
+    fig.update_layout(
+        title=f"Deep-station seasonal review | {var}",
+        template="plotly_white",
+        height=620,
+        margin=dict(l=60, r=30, t=60, b=60),
+        xaxis_title="depth group",
+        xaxis=dict(type="category", categoryorder="array", categoryarray=xlabels),
+        yaxis_title=var,
+    )
+
+    x_index = {idx + 1: idx for idx in range(len(xlabels))}
+    season_series = {
+        "Season 1 lower": [None] * len(xlabels),
+        "Season 1 upper": [None] * len(xlabels),
+        "Season 2 lower": [None] * len(xlabels),
+        "Season 2 upper": [None] * len(xlabels),
+        "All-months lower": [None] * len(xlabels),
+        "All-months upper": [None] * len(xlabels),
+    }
+    for row in rows:
+        i = x_index.get(int(row["depth_group_index"]))
+        if i is None:
+            continue
+        s = int(row["season_index"])
+        if int(row["seasons"]) == 1:
+            season_series["All-months lower"][i] = float(row["lower"])
+            season_series["All-months upper"][i] = float(row["upper"])
+        elif s == 1:
+            season_series["Season 1 lower"][i] = float(row["lower"])
+            season_series["Season 1 upper"][i] = float(row["upper"])
+        elif s == 2:
+            season_series["Season 2 lower"][i] = float(row["lower"])
+            season_series["Season 2 upper"][i] = float(row["upper"])
+
+    trace_defs = [
+        ("Season 1 lower", "#1f77b4", "dot"),
+        ("Season 1 upper", "#1f77b4", "solid"),
+        ("Season 2 lower", "#ff7f0e", "dot"),
+        ("Season 2 upper", "#ff7f0e", "solid"),
+        ("All-months lower", "#444444", "dash"),
+        ("All-months upper", "#111111", "dash"),
+    ]
+    for name, color, dash in trace_defs:
+        values = season_series[name]
+        if all(v is None for v in values):
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=xlabels,
+                y=values,
+                mode="lines+markers",
+                line=dict(color=color, width=2, dash=dash),
+                marker=dict(size=7),
+                name=name,
+                connectgaps=False,
+                hovertemplate=f"{name}<br>depth group=%{{x}}<br>limit=%{{y:.4g}}<extra></extra>",
+            )
+        )
+
+    text = _format_tsv(rows, cols)
+    status_parts = [
+        f"Deep-station groups: {', '.join(xlabels)}.",
+        f"Wrote-ready rows: {len(rows)}.",
+    ]
+    if warnings:
+        status_parts.append("Warnings: " + " | ".join(warnings))
+    status = " ".join(status_parts)
+    return fig, status, text, {"rows": rows, "columns": cols}
 
 
 app = Dash(__name__)
@@ -1330,13 +1840,30 @@ if init_var and init_station and init_depth:
 else:
     init_fig2, init_status2 = go.Figure(), ""
 
-if init_var and init_station and init_depth:
-    _sub_init3 = _subset_month_on_x(init_df, init_var, init_station, DepthBin.from_value(init_depth))
-    init_fig3, init_status3 = _add_fixed_season_limits(init_fig2, _sub_init3)
-else:
-    init_fig3, init_status3 = go.Figure(), ""
-
 init_map_fig, init_map_status = _fig_station_map()
+init_shallow_limit_files = [p.name for p in _shallow_limits_paths()]
+init_shallow_limit_file = init_shallow_limit_files[0] if init_shallow_limit_files else None
+init_fig4 = _empty_shallow_limits_review_figure("Shallow-cast season-limit review")
+init_status4 = (
+    f"Ready to review {init_shallow_limit_file}." if init_shallow_limit_file else "No shallow season-limit CSV files found."
+)
+init_text4 = ""
+init_deep_review_vars = _deep_station_variables(init_df)
+init_deep_review_var = init_deep_review_vars[0] if init_deep_review_vars else None
+init_fig5, init_status5, init_text5, init_store5 = _deep_station_review(
+    init_stats_file,
+    init_deep_review_var,
+    init_df,
+    DEFAULT_DEEP_GROUP_BREAKS[0],
+    DEFAULT_DEEP_GROUP_BREAKS[1],
+    DEFAULT_DEEP_GROUP_BREAKS[2],
+    DEFAULT_DEEP_G1_S1,
+    DEFAULT_DEEP_G1_S2,
+    DEFAULT_DEEP_G2_S1,
+    DEFAULT_DEEP_G2_S2,
+    DEFAULT_DEEP_G3_S1,
+    DEFAULT_DEEP_G3_S2,
+)
 
 app.layout = html.Div(
     style={"maxWidth": "1100px", "margin": "0 auto", "padding": "18px 14px", "fontFamily": "system-ui"},
@@ -1601,13 +2128,14 @@ app.layout = html.Div(
                     ],
                 ),
                 dcc.Tab(
-                    label="Months on x (fixed seasons 12–6 / 7–11)",
-                    value="tab-fixed",
+                    label="Review shallow season CSV",
+                    value="tab-shallow-review",
                     children=[
+                        dcc.Store(id="combined-shallow-limits-store"),
                         html.Div(
                             style={
                                 "display": "grid",
-                                "gridTemplateColumns": "2fr 2fr 2fr",
+                                "gridTemplateColumns": "2fr",
                                 "gap": "10px",
                                 "alignItems": "end",
                                 "marginTop": "10px",
@@ -1615,45 +2143,246 @@ app.layout = html.Div(
                             children=[
                                 html.Div(
                                     [
-                                        html.Div("variable", style={"fontWeight": 600}),
+                                        html.Div("shallow season CSV", style={"fontWeight": 600}),
                                         dcc.Dropdown(
-                                            id="var3",
-                                            options=[{"label": v, "value": v} for v in init_variables],
-                                            value=init_var,
+                                            id="shallow-review-file",
+                                            options=[
+                                                {"label": name, "value": name} for name in init_shallow_limit_files
+                                            ],
+                                            value=init_shallow_limit_file,
+                                            clearable=False,
+                                            placeholder="No shallow season-limit CSV files found",
+                                        ),
+                                    ]
+                                )
+                            ],
+                        ),
+                        html.Div(
+                            id="status4",
+                            children=init_status4,
+                            style={"marginTop": "8px", "fontWeight": 600, "color": "#8a2b2b"},
+                        ),
+                        dcc.Graph(id="fig4", figure=init_fig4, style={"marginTop": "6px"}),
+                        html.Div(
+                            style={"marginTop": "10px"},
+                            children=[
+                                html.Div("Combined shallow-season suggestions", style={"fontWeight": 700}),
+                                dcc.Textarea(
+                                    id="combined-shallow-limits-table",
+                                    value=init_text4,
+                                    wrap="off",
+                                    style={
+                                        "width": "100%",
+                                        "height": "130px",
+                                        "fontFamily": "Consolas, 'Lucida Console', ui-monospace, SFMono-Regular, Menlo, Monaco, monospace",
+                                        "fontSize": "11px",
+                                        "lineHeight": "1.15",
+                                        "overflowX": "auto",
+                                    },
+                                ),
+                                html.Div(
+                                    style={"display": "flex", "gap": "10px", "alignItems": "center", "marginTop": "6px"},
+                                    children=[
+                                        html.Button(
+                                            "Append suggested limits to CSV",
+                                            id="append-combined-shallow-limits",
+                                            n_clicks=0,
+                                        ),
+                                        html.Div(
+                                            id="append-combined-shallow-limits-status",
+                                            style={"fontWeight": 600, "color": "#555"},
+                                        ),
+                                    ],
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+                dcc.Tab(
+                    label="Review deep stations",
+                    value="tab-deep-review",
+                    children=[
+                        dcc.Store(id="deep-station-review-store", data=init_store5),
+                        html.Div(
+                            style={
+                                "display": "grid",
+                                "gridTemplateColumns": "2fr 1fr 1fr 1fr",
+                                "gap": "10px",
+                                "alignItems": "end",
+                                "marginTop": "10px",
+                            },
+                            children=[
+                                html.Div(
+                                    [
+                                        html.Div("deep_cast variable", style={"fontWeight": 600}),
+                                        dcc.Dropdown(
+                                            id="deep-review-var",
+                                            options=[{"label": v, "value": v} for v in init_deep_review_vars],
+                                            value=init_deep_review_var,
                                             clearable=False,
                                         ),
                                     ]
                                 ),
                                 html.Div(
                                     [
-                                        html.Div("station_type", style={"fontWeight": 600}),
-                                        dcc.Dropdown(
-                                            id="station3",
-                                            options=[{"label": s, "value": s} for s in init_station_types],
-                                            value=init_station,
-                                            clearable=False,
+                                        html.Div("group 1 max depth", style={"fontWeight": 600}),
+                                        dcc.Input(
+                                            id="deep-break-1",
+                                            type="number",
+                                            value=DEFAULT_DEEP_GROUP_BREAKS[0],
+                                            debounce=True,
+                                            style={"width": "100%"},
                                         ),
                                     ]
                                 ),
                                 html.Div(
                                     [
-                                        html.Div("depth_bin", style={"fontWeight": 600}),
-                                        dcc.Dropdown(
-                                            id="depth3",
-                                            options=init_depth_options,
-                                            value=init_depth,
-                                            clearable=False,
+                                        html.Div("group 2 max depth", style={"fontWeight": 600}),
+                                        dcc.Input(
+                                            id="deep-break-2",
+                                            type="number",
+                                            value=DEFAULT_DEEP_GROUP_BREAKS[1],
+                                            debounce=True,
+                                            style={"width": "100%"},
+                                        ),
+                                    ]
+                                ),
+                                html.Div(
+                                    [
+                                        html.Div("group 3 max depth", style={"fontWeight": 600}),
+                                        dcc.Input(
+                                            id="deep-break-3",
+                                            type="number",
+                                            value=DEFAULT_DEEP_GROUP_BREAKS[2],
+                                            debounce=True,
+                                            style={"width": "100%"},
                                         ),
                                     ]
                                 ),
                             ],
                         ),
                         html.Div(
-                            id="status3",
-                            children=init_status3,
+                            style={
+                                "display": "grid",
+                                "gridTemplateColumns": "1fr 1fr 1fr 1fr 1fr 1fr",
+                                "gap": "10px",
+                                "alignItems": "end",
+                                "marginTop": "10px",
+                            },
+                            children=[
+                                html.Div(
+                                    [
+                                        html.Div("Group 1 season 1 months", style={"fontWeight": 600}),
+                                        dcc.Input(
+                                            id="deep-g1-s1",
+                                            type="text",
+                                            value=DEFAULT_DEEP_G1_S1,
+                                            debounce=True,
+                                            style={"width": "100%"},
+                                        ),
+                                    ]
+                                ),
+                                html.Div(
+                                    [
+                                        html.Div("Group 1 season 2 months", style={"fontWeight": 600}),
+                                        dcc.Input(
+                                            id="deep-g1-s2",
+                                            type="text",
+                                            value=DEFAULT_DEEP_G1_S2,
+                                            debounce=True,
+                                            style={"width": "100%"},
+                                        ),
+                                    ]
+                                ),
+                                html.Div(
+                                    [
+                                        html.Div("Group 2 season 1 months", style={"fontWeight": 600}),
+                                        dcc.Input(
+                                            id="deep-g2-s1",
+                                            type="text",
+                                            value=DEFAULT_DEEP_G2_S1,
+                                            debounce=True,
+                                            style={"width": "100%"},
+                                        ),
+                                    ]
+                                ),
+                                html.Div(
+                                    [
+                                        html.Div("Group 2 season 2 months", style={"fontWeight": 600}),
+                                        dcc.Input(
+                                            id="deep-g2-s2",
+                                            type="text",
+                                            value=DEFAULT_DEEP_G2_S2,
+                                            debounce=True,
+                                            style={"width": "100%"},
+                                        ),
+                                    ]
+                                ),
+                                html.Div(
+                                    [
+                                        html.Div("Group 3 season 1 months", style={"fontWeight": 600}),
+                                        dcc.Input(
+                                            id="deep-g3-s1",
+                                            type="text",
+                                            value=DEFAULT_DEEP_G3_S1,
+                                            debounce=True,
+                                            style={"width": "100%"},
+                                        ),
+                                    ]
+                                ),
+                                html.Div(
+                                    [
+                                        html.Div("Group 3 season 2 months", style={"fontWeight": 600}),
+                                        dcc.Input(
+                                            id="deep-g3-s2",
+                                            type="text",
+                                            value=DEFAULT_DEEP_G3_S2,
+                                            debounce=True,
+                                            style={"width": "100%"},
+                                        ),
+                                    ]
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            id="status5",
+                            children=init_status5,
                             style={"marginTop": "8px", "fontWeight": 600, "color": "#8a2b2b"},
                         ),
-                        dcc.Graph(id="fig3", figure=init_fig3, style={"marginTop": "6px"}),
+                        dcc.Graph(id="fig5", figure=init_fig5, style={"marginTop": "6px"}),
+                        html.Div(
+                            style={"marginTop": "10px"},
+                            children=[
+                                html.Div("Deep-station seasonal limits", style={"fontWeight": 700}),
+                                dcc.Textarea(
+                                    id="deep-review-table",
+                                    value=init_text5,
+                                    wrap="off",
+                                    style={
+                                        "width": "100%",
+                                        "height": "160px",
+                                        "fontFamily": "Consolas, 'Lucida Console', ui-monospace, SFMono-Regular, Menlo, Monaco, monospace",
+                                        "fontSize": "11px",
+                                        "lineHeight": "1.15",
+                                        "overflowX": "auto",
+                                    },
+                                ),
+                                html.Div(
+                                    style={"display": "flex", "gap": "10px", "alignItems": "center", "marginTop": "6px"},
+                                    children=[
+                                        html.Button(
+                                            "Write deep-station limits to CSV",
+                                            id="append-deep-review-limits",
+                                            n_clicks=0,
+                                        ),
+                                        html.Div(
+                                            id="append-deep-review-limits-status",
+                                            style={"fontWeight": 600, "color": "#555"},
+                                        ),
+                                    ],
+                                ),
+                            ],
+                        ),
                     ],
                 ),
             ],
@@ -1677,18 +2406,15 @@ def _update_stats_file_label(stats_file: str):
     Output("var2", "value"),
     Output("station2", "options"),
     Output("station2", "value"),
-    Output("var3", "options"),
-    Output("var3", "value"),
-    Output("station3", "options"),
-    Output("station3", "value"),
+    Output("deep-review-var", "options"),
+    Output("deep-review-var", "value"),
     Input("stats-file", "value"),
     State("var1", "value"),
     State("station1", "value"),
     State("month1", "value"),
     State("var2", "value"),
     State("station2", "value"),
-    State("var3", "value"),
-    State("station3", "value"),
+    State("deep-review-var", "value"),
 )
 def _sync_dropdown_options_for_stats_file(
     stats_file: str,
@@ -1697,11 +2423,11 @@ def _sync_dropdown_options_for_stats_file(
     month1: int | None,
     var2: str | None,
     station2: str | None,
-    var3: str | None,
-    station3: str | None,
+    deep_review_var: str | None,
 ):
     df = _get_stats_df(stats_file)
     variables, station_types, months = _stats_meta(df)
+    deep_variables = _deep_station_variables(df)
 
     def pick(current, options):
         return current if current in options else (options[0] if options else None)
@@ -1711,8 +2437,7 @@ def _sync_dropdown_options_for_stats_file(
     m1 = pick(int(month1) if month1 is not None else None, months)
     v2 = pick(var2, variables)
     s2 = pick(station2, station_types)
-    v3 = pick(var3, variables)
-    s3 = pick(station3, station_types)
+    v5 = pick(deep_review_var, deep_variables)
 
     return (
         [{"label": v, "value": v} for v in variables],
@@ -1725,10 +2450,8 @@ def _sync_dropdown_options_for_stats_file(
         v2,
         [{"label": s, "value": s} for s in station_types],
         s2,
-        [{"label": v, "value": v} for v in variables],
-        v3,
-        [{"label": s, "value": s} for s in station_types],
-        s3,
+        [{"label": v, "value": v} for v in deep_variables],
+        v5,
     )
 
 
@@ -1986,16 +2709,9 @@ def _update_fig2(
     sub = _subset_month_on_x(df, var, station_type, depth_bin)
     locked, locked_groups = _locked_seasons(lock_seasons_value, lock_data)
 
-    # Requirement:
-    # - deep_cast: if seasons are locked, write out all depth-bin groups (all depth bins)
-    # - shallow_cast: just one depth-bin group (the currently selected depth bin), for both textbox + CSV
-    if station_key == "shallow_cast":
-        locked = False
-        locked_groups = None
-
     fig2, season_status = _add_season_limits(fig, sub, seasons=seasons or 1, locked_groups=locked_groups)
 
-    if station_key == "deep_cast" and locked and locked_groups:
+    if station_key in {"deep_cast", "shallow_cast"} and locked and locked_groups:
         rows, cols = _compute_season_limit_rows_all_depth_bins(
             stats_file,
             var,
@@ -2025,43 +2741,110 @@ def _update_fig2(
 
 
 @app.callback(
-    Output("depth3", "options"),
-    Output("depth3", "value"),
-    Output("fig3", "figure"),
-    Output("status3", "children"),
-    Input("stats-file", "value"),
-    Input("var3", "value"),
-    Input("station3", "value"),
-    Input("depth3", "value"),
+    Output("shallow-review-file", "options"),
+    Output("shallow-review-file", "value"),
+    Input("append-season-limits-status", "children"),
+    State("shallow-review-file", "value"),
 )
-def _update_fig3(stats_file: str, var: str, station_type: str, depth_value: str | None):
+def _refresh_shallow_review_files(_status: str | None, current_value: str | None):
+    files = [p.name for p in _shallow_limits_paths()]
+    options = [{"label": name, "value": name} for name in files]
+    if not files:
+        return options, None
+    if current_value in files:
+        return options, current_value
+    return options, files[0]
+
+
+@app.callback(
+    Output("fig4", "figure"),
+    Output("status4", "children"),
+    Output("combined-shallow-limits-table", "value"),
+    Output("combined-shallow-limits-store", "data"),
+    Input("shallow-review-file", "value"),
+    Input("append-season-limits-status", "children"),
+)
+def _update_shallow_review(csv_file: str | None, _status: str | None):
+    fig, status, text = _review_shallow_limits(csv_file)
+    path = HERE / csv_file if csv_file else None
+    rows: list[dict] = []
+    cols = [
+        "source_file",
+        "stats_file",
+        "variable",
+        "station_type",
+        "seasons",
+        "season_index",
+        "months",
+        "depth_bin_count",
+        "depth_bin_low",
+        "depth_bin_high",
+        "suggested_lower",
+        "suggested_upper",
+    ]
+    if path and path.exists():
+        try:
+            df = _load_shallow_limits_df(path)
+            rows, cols = _combine_shallow_limits_rows(csv_file, df)
+        except Exception:
+            rows = []
+    return fig, status, text, {"rows": rows, "columns": cols}
+
+
+@app.callback(
+    Output("fig5", "figure"),
+    Output("status5", "children"),
+    Output("deep-review-table", "value"),
+    Output("deep-station-review-store", "data"),
+    Input("stats-file", "value"),
+    Input("deep-review-var", "value"),
+    Input("deep-break-1", "value"),
+    Input("deep-break-2", "value"),
+    Input("deep-break-3", "value"),
+    Input("deep-g1-s1", "value"),
+    Input("deep-g1-s2", "value"),
+    Input("deep-g2-s1", "value"),
+    Input("deep-g2-s2", "value"),
+    Input("deep-g3-s1", "value"),
+    Input("deep-g3-s2", "value"),
+)
+def _update_deep_station_review(
+    stats_file: str,
+    var: str | None,
+    break1: float | None,
+    break2: float | None,
+    break3: float | None,
+    g1_s1: str | None,
+    g1_s2: str | None,
+    g2_s1: str | None,
+    g2_s2: str | None,
+    g3_s1: str | None,
+    g3_s2: str | None,
+):
     df = _get_stats_df(stats_file)
-    _, _, months = _stats_meta(df)
-    bins = _depth_bin_options(df, var, station_type)
-    options = [{"label": b.label, "value": b.value} for b in bins]
+    return _deep_station_review(
+        stats_file, var, df, break1, break2, break3, g1_s1, g1_s2, g2_s1, g2_s2, g3_s1, g3_s2
+    )
 
-    if not bins:
-        fig = go.Figure()
-        fig.update_layout(
-            title=f"{var} | {station_type} (no depth bins)",
-            template="plotly_white",
-            height=600,
-            margin=dict(l=60, r=30, t=60, b=60),
-        )
-        return options, None, fig, "No depth bins for this selection."
 
-    valid_values = {b.value for b in bins}
-    if depth_value not in valid_values:
-        depth_value = bins[0].value
+@app.callback(
+    Output("append-deep-review-limits", "disabled"),
+    Input("deep-station-review-store", "data"),
+)
+def _disable_append_deep_review_limits(data: dict | None) -> bool:
+    if not data:
+        return True
+    return not bool(data.get("rows"))
 
-    depth_bin = DepthBin.from_value(depth_value)
-    fig, status = _fig_month_on_x(df, months, var, station_type, depth_bin)
-    sub = _subset_month_on_x(df, var, station_type, depth_bin)
-    fig3, limits_status = _add_fixed_season_limits(fig, sub)
-    combined_status = limits_status or status
-    if status and limits_status:
-        combined_status = f"{status} | {limits_status}"
-    return options, depth_value, fig3, combined_status
+
+@app.callback(
+    Output("append-combined-shallow-limits", "disabled"),
+    Input("combined-shallow-limits-store", "data"),
+)
+def _disable_append_combined_shallow_limits(data: dict | None) -> bool:
+    if not data:
+        return True
+    return not bool(data.get("rows"))
 
 
 @app.callback(
@@ -2123,7 +2906,7 @@ def _append_depth_limits(
     out_path = HERE / (
         f"depthbin_limits_{_safe_filename_component(var)}_{_safe_filename_component(station_type)}.csv"
     )
-    n = _append_rows_to_csv(out_path, rows, cols)
+    n = _write_rows_to_csv(out_path, rows, cols)
     if locked and locked_segments:
         return f"Wrote {n} row(s) to {out_path.name}"
     return f"Wrote {n} row(s) to {out_path.name} (current selection)"
@@ -2160,7 +2943,44 @@ def _append_season_limits(
     out_path = HERE / (
         f"season_limits_{_safe_filename_component(var)}_{_safe_filename_component(station_type)}.csv"
     )
+    n = _write_rows_to_csv(out_path, rows, cols)
+    return f"Wrote {n} row(s) to {out_path.name}"
+
+
+@app.callback(
+    Output("append-combined-shallow-limits-status", "children"),
+    Input("append-combined-shallow-limits", "n_clicks"),
+    State("combined-shallow-limits-store", "data"),
+    prevent_initial_call=True,
+)
+def _append_combined_shallow_limits(n_clicks: int, data: dict | None):
+    if not data:
+        return "No suggested limits to append."
+    rows = data.get("rows") or []
+    cols = data.get("columns") or []
+    if not rows:
+        return "No suggested limits to append."
+    out_path = HERE / SHALLOW_COMBINED_LIMITS_FILE
     n = _append_rows_to_csv(out_path, rows, cols)
+    return f"Appended {n} row(s) to {out_path.name}"
+
+
+@app.callback(
+    Output("append-deep-review-limits-status", "children"),
+    Input("append-deep-review-limits", "n_clicks"),
+    State("deep-station-review-store", "data"),
+    State("deep-review-var", "value"),
+    prevent_initial_call=True,
+)
+def _append_deep_review_limits(n_clicks: int, data: dict | None, var: str | None):
+    if not data:
+        return "No deep-station limits to write."
+    rows = data.get("rows") or []
+    cols = data.get("columns") or []
+    if not rows:
+        return "No deep-station limits to write."
+    out_path = HERE / f"season_limits_{_safe_filename_component(var)}_deep_depth_groups.csv"
+    n = _write_rows_to_csv(out_path, rows, cols)
     return f"Wrote {n} row(s) to {out_path.name}"
 
 
