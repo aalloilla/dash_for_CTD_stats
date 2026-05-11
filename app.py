@@ -8,7 +8,7 @@ import re
 
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, State, dcc, html
+from dash import Dash, Input, Output, State, ctx, dcc, html
 
 
 HERE = Path(__file__).resolve().parent
@@ -1785,7 +1785,11 @@ def _deep_station_review(
     ]
     if not var:
         fig = go.Figure()
-        fig.update_layout(template="plotly_white", height=600, title="Deep-station seasonal review")
+        fig.update_layout(
+            template="plotly_white",
+            height=600,
+            title=f"Deep-station seasonal review | {stats_file}",
+        )
         return fig, "No deep variable selected.", _format_tsv([], cols), {"rows": [], "columns": cols}
 
     try:
@@ -1794,12 +1798,20 @@ def _deep_station_review(
         b3 = float(break3 if break3 is not None else DEFAULT_DEEP_GROUP_BREAKS[2])
     except (TypeError, ValueError):
         fig = go.Figure()
-        fig.update_layout(template="plotly_white", height=600, title=f"Deep-station seasonal review | {var}")
+        fig.update_layout(
+            template="plotly_white",
+            height=600,
+            title=f"Deep-station seasonal review | {stats_file} | {var}",
+        )
         return fig, "Depth break values must be numeric.", _format_tsv([], cols), {"rows": [], "columns": cols}
 
     if not (0 <= b1 < b2 < b3):
         fig = go.Figure()
-        fig.update_layout(template="plotly_white", height=600, title=f"Deep-station seasonal review | {var}")
+        fig.update_layout(
+            template="plotly_white",
+            height=600,
+            title=f"Deep-station seasonal review | {stats_file} | {var}",
+        )
         return (
             fig,
             "Depth group boundaries must satisfy 0 <= break1 < break2 < break3.",
@@ -1819,7 +1831,11 @@ def _deep_station_review(
         season2, err2 = _parse_month_text(s2_text)
         if err1 or err2:
             fig = go.Figure()
-            fig.update_layout(template="plotly_white", height=600, title=f"Deep-station seasonal review | {var}")
+            fig.update_layout(
+                template="plotly_white",
+                height=600,
+                title=f"Deep-station seasonal review | {stats_file} | {var}",
+            )
             msg = f"Depth group {idx}: {err1 or err2}"
             return fig, msg, _format_tsv([], cols), {"rows": [], "columns": cols}
         group_warning = _month_groups_warning([season1, season2])
@@ -1834,7 +1850,7 @@ def _deep_station_review(
 
     fig = go.Figure()
     fig.update_layout(
-        title=f"Deep-station seasonal review | {var}",
+        title=f"Deep-station seasonal review | {stats_file} | {var}",
         template="plotly_white",
         height=620,
         margin=dict(l=60, r=30, t=60, b=60),
@@ -1894,6 +1910,7 @@ def _deep_station_review(
 
     text = _format_tsv(rows, cols)
     status_parts = [
+        f"Stats file: {stats_file}.",
         f"Deep-station groups: {', '.join(xlabels)}.",
         f"Wrote-ready rows: {len(rows)}.",
     ]
@@ -3102,11 +3119,21 @@ def _append_combined_shallow_limits(n_clicks: int, data: dict | None):
 @app.callback(
     Output("append-deep-review-limits-status", "children"),
     Input("append-deep-review-limits", "n_clicks"),
+    Input("stats-file", "value"),
+    Input("deep-review-var", "value"),
     State("deep-station-review-store", "data"),
-    State("deep-review-var", "value"),
     prevent_initial_call=True,
 )
-def _append_deep_review_limits(n_clicks: int, data: dict | None, var: str | None):
+def _append_deep_review_limits(
+    n_clicks: int,
+    stats_file: str,
+    var: str | None,
+    data: dict | None,
+):
+    trigger = getattr(ctx, "triggered_id", None)
+    if trigger in {"stats-file", "deep-review-var"}:
+        return ""
+    del n_clicks, stats_file
     if not data:
         return "No deep-station limits to write."
     rows = data.get("rows") or []
