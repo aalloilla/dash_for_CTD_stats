@@ -22,6 +22,7 @@ DEFAULT_STATS_FILE = STATS_PATHS[0].name
 
 SHALLOW_LIMITS_FILE_GLOB = "season_limits_*_shallow_cast.csv"
 SHALLOW_COMBINED_LIMITS_FILE = "season_limits_shallow_cast_combined.csv"
+SHALLOW_DEPTH_THRESHOLD_M = 15.0
 DEFAULT_DEEP_GROUP_BREAKS = (40.0, 120.0, 210.0)
 DEFAULT_DEEP_G1_S1 = "11,12,1,2,3,4"
 DEFAULT_DEEP_G1_S2 = "5,6,7,8,9,10"
@@ -163,6 +164,10 @@ def _load_geojson(path: Path) -> dict:
 
 STATIONS_DF = _load_stations(STATIONS_CSV) if STATIONS_CSV.exists() else pd.DataFrame(columns=["station", "lat_mean", "lon_mean"])
 POLYGON_GEOJSON = _load_geojson(POLYGON_GEOJSON_PATH) if POLYGON_GEOJSON_PATH.exists() else None
+STATION_NAME_OPTIONS = [
+    {"label": station, "value": station}
+    for station in sorted(STATIONS_DF["station"].dropna().astype(str).drop_duplicates().tolist())
+]
 
 
 def _get_prepared_shallow_geom():
@@ -235,7 +240,11 @@ def _auto_zoom(lat: list[float], lon: list[float]) -> int:
     return 9
 
 
-def _fig_station_map() -> tuple[go.Figure, str]:
+def _station_key(value: str | None) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _fig_station_map(selected_station: str | None = None) -> tuple[go.Figure, str]:
     if STATIONS_DF.empty:
         fig = go.Figure()
         fig.update_layout(template="plotly_white", height=650, margin=dict(l=10, r=10, t=30, b=10))
@@ -276,71 +285,152 @@ def _fig_station_map() -> tuple[go.Figure, str]:
         )
 
     stations = STATIONS_DF.copy()
-    if _SHALLOW_HIT is not None:
-        stations["in_polygon"] = [
-            bool(_SHALLOW_HIT(lon, lat))
-            for lon, lat in zip(stations["lon_mean"].astype(float), stations["lat_mean"].astype(float))
-        ]
-    else:
-        stations["in_polygon"] = False
+    stations["station_key"] = stations["station"].astype(str).map(_station_key)
+    stations["is_shallow"] = stations["depth_m"].notna() & (
+        stations["depth_m"].astype(float) <= SHALLOW_DEPTH_THRESHOLD_M
+    )
+    stations["is_deep"] = stations["depth_m"].notna() & (
+        stations["depth_m"].astype(float) > SHALLOW_DEPTH_THRESHOLD_M
+    )
 
-    inside = stations[stations["in_polygon"]].copy()
-    outside = stations[~stations["in_polygon"]].copy()
+    shallow = stations[stations["is_shallow"]].copy()
+    deep = stations[stations["is_deep"]].copy()
+    unknown = stations[~stations["depth_m"].notna()].copy()
+    selected = pd.DataFrame(columns=stations.columns)
+    if selected_station:
+        selected_key = _station_key(selected_station)
+        selected = stations[stations["station_key"] == selected_key].copy()
+        if not selected.empty:
+            center = {
+                "lat": float(selected["lat_mean"].astype(float).mean()),
+                "lon": float(selected["lon_mean"].astype(float).mean()),
+            }
+            zoom = 11
+            selected_names = set(selected["station"].astype(str).tolist())
+            shallow = shallow[~shallow["station"].astype(str).isin(selected_names)].copy()
+            deep = deep[~deep["station"].astype(str).isin(selected_names)].copy()
+            unknown = unknown[~unknown["station"].astype(str).isin(selected_names)].copy()
 
     # Export station classification for downstream use.
-    if _SHALLOW_HIT is not None:
-        shallow = (
-            stations.loc[stations["in_polygon"], "station"].astype(str).dropna().drop_duplicates().sort_values().tolist()
-        )
-        deep = (
-            stations.loc[~stations["in_polygon"], "station"].astype(str).dropna().drop_duplicates().sort_values().tolist()
-        )
-        payload = {"shallow": shallow, "deep": deep}
-        try:
-            STATION_CLASSIFICATION_JSON.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        except Exception:
-            # Non-fatal; map should still render.
-            pass
+    payload = {
+        "shallow": (
+            stations.loc[stations["is_shallow"], "station"].astype(str).dropna().drop_duplicates().sort_values().tolist()
+        ),
+        "deep": (
+            stations.loc[stations["is_deep"], "station"].astype(str).dropna().drop_duplicates().sort_values().tolist()
+        ),
+    }
+    try:
+        STATION_CLASSIFICATION_JSON.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception:
+        # Non-fatal; map should still render.
+        pass
 
-    # Station points (outside first so inside is on top)
-    if not outside.empty:
+    # Station points (deep first so shallow is on top)
+    if not deep.empty:
         fig.add_trace(
             go.Scattermapbox(
-                lat=outside["lat_mean"].astype(float).tolist(),
-                lon=outside["lon_mean"].astype(float).tolist(),
+                lat=deep["lat_mean"].astype(float).tolist(),
+                lon=deep["lon_mean"].astype(float).tolist(),
                 mode="markers",
-                marker=dict(size=8, color="rgba(120, 120, 120, 0.75)"),
-                text=outside["station"].tolist(),
-                customdata=outside[["depth_m"]].to_numpy(),
-                hovertemplate="Station %{text}<br>Outside polygon<br>depth=%{customdata[0]:.2f} m<br>(%{lat:.4f}, %{lon:.4f})<extra></extra>",
-                name="Stations (outside)",
+                marker=dict(size=8, color="rgba(31, 119, 180, 0.85)"),
+                text=deep["station"].tolist(),
+                customdata=deep[["depth_m"]].to_numpy(),
+                hovertemplate=(
+                    f"Station %{{text}}<br><b>Deep</b> (&gt; {SHALLOW_DEPTH_THRESHOLD_M:g} m)"
+                    "<br>depth=%{customdata[0]:.2f} m<br>(%{lat:.4f}, %{lon:.4f})<extra></extra>"
+                ),
+                name="Deep stations",
             )
         )
 
-    if not inside.empty:
+    if not shallow.empty:
         fig.add_trace(
             go.Scattermapbox(
-                lat=inside["lat_mean"].astype(float).tolist(),
-                lon=inside["lon_mean"].astype(float).tolist(),
+                lat=shallow["lat_mean"].astype(float).tolist(),
+                lon=shallow["lon_mean"].astype(float).tolist(),
                 mode="markers",
-                marker=dict(size=10, color="rgba(220, 20, 60, 0.92)"),
-                text=inside["station"].tolist(),
-                customdata=inside[["depth_m"]].to_numpy(),
-                hovertemplate="Station %{text}<br><b>Inside polygon</b><br>depth=%{customdata[0]:.2f} m<br>(%{lat:.4f}, %{lon:.4f})<extra></extra>",
-                name="Stations (inside)",
+                marker=dict(size=10, color="rgba(44, 160, 44, 0.92)"),
+                text=shallow["station"].tolist(),
+                customdata=shallow[["depth_m"]].to_numpy(),
+                hovertemplate=(
+                    f"Station %{{text}}<br><b>Shallow</b> (&lt;= {SHALLOW_DEPTH_THRESHOLD_M:g} m)"
+                    "<br>depth=%{customdata[0]:.2f} m<br>(%{lat:.4f}, %{lon:.4f})<extra></extra>"
+                ),
+                name="Shallow stations",
+            )
+        )
+
+    if not unknown.empty:
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=unknown["lat_mean"].astype(float).tolist(),
+                lon=unknown["lon_mean"].astype(float).tolist(),
+                mode="markers",
+                marker=dict(size=7, color="rgba(120, 120, 120, 0.75)"),
+                text=unknown["station"].tolist(),
+                customdata=unknown[["depth_m"]].to_numpy(),
+                hovertemplate=(
+                    "Station %{text}<br><b>Unknown depth</b>"
+                    "<br>depth=%{customdata[0]}<br>(%{lat:.4f}, %{lon:.4f})<extra></extra>"
+                ),
+                name="Unknown depth",
+            )
+        )
+
+    if not selected.empty:
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=selected["lat_mean"].astype(float).tolist(),
+                lon=selected["lon_mean"].astype(float).tolist(),
+                mode="markers",
+                marker=dict(size=26, color="rgba(17, 17, 17, 0.95)"),
+                text=selected["station"].tolist(),
+                customdata=selected[["depth_m"]].to_numpy(),
+                hovertemplate="Selected station %{text}<br>depth=%{customdata[0]:.2f} m<br>(%{lat:.4f}, %{lon:.4f})<extra></extra>",
+                name="Selected station",
+                showlegend=False,
+            )
+        )
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=selected["lat_mean"].astype(float).tolist(),
+                lon=selected["lon_mean"].astype(float).tolist(),
+                mode="markers",
+                marker=dict(size=18, color="rgba(255, 215, 0, 0.98)"),
+                text=selected["station"].tolist(),
+                customdata=selected[["depth_m"]].to_numpy(),
+                hovertemplate="Selected station %{text}<br>depth=%{customdata[0]:.2f} m<br>(%{lat:.4f}, %{lon:.4f})<extra></extra>",
+                name="Selected station",
+            )
+        )
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=selected["lat_mean"].astype(float).tolist(),
+                lon=selected["lon_mean"].astype(float).tolist(),
+                mode="text",
+                text=selected["station"].tolist(),
+                textposition="top right",
+                textfont=dict(size=13, color="#111111"),
+                hoverinfo="skip",
+                showlegend=False,
             )
         )
 
     fig.update_layout(
         title=dict(
-            text="Stations and shallow polygon",
+            text=(
+                f"Stations by depth class | {selected_station}"
+                if selected_station and not selected.empty
+                else "Stations by depth class"
+            ),
             y=0.99,
             yanchor="top",
             pad=dict(b=10),
         ),
         height=650,
         margin=dict(l=10, r=10, t=70, b=10),
-        # Use a minimal raster basemap without admin boundary clutter.
+        # Use an ocean basemap with bathymetric/topographic context.
         mapbox=dict(
             style="white-bg",
             center=center,
@@ -348,20 +438,27 @@ def _fig_station_map() -> tuple[go.Figure, str]:
             layers=[
                 {
                     "sourcetype": "raster",
-                    "source": ["https://basemaps.cartocdn.com/rastertiles/light_nolabels/{z}/{x}/{y}.png"],
+                    "source": [
+                        "https://services.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}"
+                    ],
                     "below": "traces",
                 }
             ],
         ),
+        uirevision=f"station-map::{_station_key(selected_station)}",
         legend=dict(orientation="h", yanchor="bottom", y=0.965, xanchor="left", x=0),
     )
-    if _SHALLOW_HIT is None:
-        status = f"Inside/outside unavailable. {_SHALLOW_INFO}"
-    else:
-        status = (
-            f"Stations inside polygon: {len(inside)} | outside: {len(outside)}. "
-            f"Wrote: {STATION_CLASSIFICATION_JSON.name}. {_SHALLOW_INFO}"
-        )
+    status = (
+        f"Shallow (<= {SHALLOW_DEPTH_THRESHOLD_M:g} m): {int(stations['is_shallow'].sum())} | "
+        f"deep (> {SHALLOW_DEPTH_THRESHOLD_M:g} m): {int(stations['is_deep'].sum())} | "
+        f"unknown depth: {int(stations['depth_m'].isna().sum())}. "
+        f"Wrote: {STATION_CLASSIFICATION_JSON.name}."
+    )
+    if selected_station:
+        if selected.empty:
+            status = f"{status} Search match not found for {selected_station!r}."
+        else:
+            status = f"{status} Selected station: {selected_station}."
     return fig, status
 
 
@@ -1906,11 +2003,37 @@ app.layout = html.Div(
                     value="tab-map",
                     children=[
                         html.Div(
+                            style={
+                                "display": "grid",
+                                "gridTemplateColumns": "2fr",
+                                "gap": "10px",
+                                "alignItems": "end",
+                                "marginTop": "10px",
+                            },
+                            children=[
+                                html.Div(
+                                    [
+                                        html.Div("station search", style={"fontWeight": 600}),
+                                        dcc.Dropdown(
+                                            id="map-station-search",
+                                            options=STATION_NAME_OPTIONS,
+                                            value=None,
+                                            placeholder="Search station name...",
+                                            clearable=True,
+                                        ),
+                                    ]
+                                )
+                            ],
+                        ),
+                        html.Div(
                             id="map-status",
                             children=init_map_status,
                             style={"marginTop": "10px", "fontWeight": 600, "color": "#8a2b2b"},
                         ),
-                        dcc.Graph(id="map-fig", figure=init_map_fig, style={"marginTop": "6px"}),
+                        html.Div(
+                            id="map-fig-wrap",
+                            children=dcc.Graph(id="map-fig", figure=init_map_fig, style={"marginTop": "6px"}),
+                        ),
                     ],
                 ),
                 dcc.Tab(
@@ -2393,6 +2516,17 @@ app.layout = html.Div(
 @app.callback(Output("stats-file-label", "children"), Input("stats-file", "value"))
 def _update_stats_file_label(stats_file: str):
     return ["Using: ", html.Code(str(stats_file))]
+
+
+@app.callback(Output("map-fig-wrap", "children"), Output("map-status", "children"), Input("map-station-search", "value"))
+def _update_station_map(selected_station: str | None):
+    fig, status = _fig_station_map(selected_station)
+    graph = dcc.Graph(
+        id="map-fig",
+        figure=fig,
+        style={"marginTop": "6px"},
+    )
+    return graph, status
 
 
 @app.callback(
